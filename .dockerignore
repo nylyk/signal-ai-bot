@@ -1,0 +1,12 @@
+/target
+.git
+.gitignore
+.env
+.env.*
+run.sh
+README.md
+.idea/
+.vscode/
+*.swp
+.DS_Store
+/data

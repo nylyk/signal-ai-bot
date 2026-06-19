@@ -8,7 +8,7 @@ pub struct AiClient {
     key: String,
     model: String,
     system: Option<String>,
-    reasoning_budget: Option<i64>,
+    reasoning_budget: i64,
 }
 
 impl AiClient {
@@ -17,7 +17,7 @@ impl AiClient {
         key: String,
         model: String,
         system: Option<String>,
-        reasoning_budget: Option<i64>,
+        reasoning_budget: i64,
     ) -> Self {
         AiClient {
             http: reqwest::Client::new(),
@@ -43,13 +43,12 @@ impl AiClient {
             "messages": messages,
         });
 
-        // per-request reasoning control (llama.cpp). harmless on apis that
-        // ignore these fields. budget 0 disables thinking; we also pass the
-        // template kwarg since on some models the budget alone isn't enough.
-        if let Some(budget) = self.reasoning_budget {
-            body["reasoning_budget"] = serde_json::json!(budget);
-            body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": budget != 0 });
-        }
+        // per-request reasoning control (llama.cpp), harmless on apis that
+        // ignore these fields. budget 0 disables thinking; the template kwarg is
+        // sent too since on some models the budget alone isn't enough.
+        let budget = self.reasoning_budget;
+        body["reasoning_budget"] = serde_json::json!(budget);
+        body["chat_template_kwargs"] = serde_json::json!({ "enable_thinking": budget != 0 });
 
         let resp = self
             .http

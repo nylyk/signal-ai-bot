@@ -9,8 +9,6 @@ presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
 
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
-directories = "6"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = [
   "png",

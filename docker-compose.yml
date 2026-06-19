@@ -1,0 +1,19 @@
+services:
+  signal-ai-bot:
+    build: .
+    user: 1000:1000
+    # share the host network so localhost reaches llama.cpp
+    # (when deploying you would want them to be in the same network)
+    network_mode: host
+    environment:
+      API_BASE: http://localhost:8080/v1
+      API_KEY: not-needed
+      MODEL: qwen3.6
+      SYSTEM_PROMPT: you are a helpful assistant
+      TRIGGER: "@ai"
+      THINKING_MESSAGE: ai is thinking…
+      CONTEXT_MESSAGES: 10
+      REASONING_BUDGET: 0
+      DEVICE_NAME: signal-ai-bot-dev
+    volumes:
+      - ./data:/data
