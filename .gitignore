@@ -1,0 +1,17 @@
+# rust build artifacts
+/target
+
+# environment / secrets (AI_API_KEY etc.)
+.env
+.env.*
+# local run script holds your api key; commit run.sh.example instead
+/run.sh
+
+# claude code local settings
+.claude/settings.local.json
+
+# editor / os cruft
+.idea/
+.vscode/
+*.swp
+.DS_Store
