@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+const MAX_ENTRIES: usize = 500;
 
 // the bot's own replies aren't reliably persisted by presage (sent edits don't
 // update the local store), so we keep our own record: sent-timestamp -> final
 // answer text. used to show past replies in context and to label them as AI.
 pub struct AiReplies {
     path: PathBuf,
-    map: HashMap<u64, String>,
+    map: BTreeMap<u64, String>,
 }
 
 impl AiReplies {
@@ -24,6 +26,9 @@ impl AiReplies {
 
     pub fn record(&mut self, ts: u64, text: String) {
         self.map.insert(ts, text);
+        while self.map.len() > MAX_ENTRIES {
+            self.map.pop_first();
+        }
         if let Ok(s) = serde_json::to_string(&self.map) {
             let _ = std::fs::write(&self.path, s);
         }
