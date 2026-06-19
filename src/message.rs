@@ -158,7 +158,7 @@ async fn reply_ref<S: Store>(
 pub struct Version {
     pub own_ts: u64,
     pub target: Option<u64>,
-    pub is_ai: bool,                // an "ai is thinking…" placeholder => an ai reply
+    pub is_ai: bool,                // started life as the bot's placeholder => an ai reply
     pub speaker: String,            // resolved display name of the sender
     pub reply_to: Option<ReplyRef>, // who/what this message replies to, if any
     pub body: String,

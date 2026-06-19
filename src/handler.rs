@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use futures::{pin_mut, StreamExt};
+use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
 use presage::libsignal_service::content::DataMessage;
 use presage::manager::Registered;
 use presage::model::messages::Received;
@@ -9,6 +9,7 @@ use presage::store::{ContentExt, Store};
 use presage::Manager;
 use tracing::{error, info};
 
+use crate::ai::Phase;
 use crate::config::Config;
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
@@ -142,29 +143,53 @@ async fn build_convo<S: Store>(
     (convo, image_count)
 }
 
-// post the "thinking" placeholder, ask the ai, then edit the placeholder into
-// the answer. returns the placeholder's sent-timestamp and the final answer so
-// the caller can record it (presage won't persist this edit).
+// post the placeholder, stream the completion while editing the placeholder to
+// reflect each phase (processing -> reasoning -> generating), then edit it into
+// the answer. returns the placeholder's and the final edit's sent-timestamps
+// plus the answer so the caller can record it under both (presage won't persist
+// these edits, and a reply may quote either timestamp).
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     recipient: Recipient,
     trigger_ts: u64,
     convo: Vec<serde_json::Value>,
-) -> anyhow::Result<(u64, String)> {
+) -> anyhow::Result<(u64, u64, String)> {
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
-    let thinking_ts = now_ts().max(trigger_ts + 1);
+    let placeholder_ts = now_ts().max(trigger_ts + 1);
     let placeholder = DataMessage {
-        body: Some(cfg.thinking_msg.clone()),
-        timestamp: Some(thinking_ts),
+        body: Some(cfg.processing_msg.clone()),
+        timestamp: Some(placeholder_ts),
         group_v2: recipient.group_context(),
         ..Default::default()
     };
-    send_to(manager, &recipient, placeholder.into(), thinking_ts).await?;
+    send_to(manager, &recipient, placeholder.into(), placeholder_ts).await?;
 
-    // ask the ai, then edit the placeholder to the answer
-    let answer = match cfg.ai.complete(convo).await {
+    // stream the completion: the ai side reports phase changes over the channel,
+    // and we edit the placeholder to the matching status message as they arrive
+    let (tx, mut rx) = mpsc::unbounded();
+    let mut last_ts = placeholder_ts;
+    let stream = cfg.ai.complete(convo, move |p| {
+        let _ = tx.unbounded_send(p);
+    });
+    let edits = async {
+        while let Some(phase) = rx.next().await {
+            let msg = match phase {
+                Phase::Reasoning => &cfg.reasoning_msg,
+                Phase::Generating => &cfg.generating_msg,
+            };
+            let edit_ts = now_ts().max(last_ts + 1);
+            last_ts = edit_ts;
+            if let Err(e) = send_edit(manager, &recipient, placeholder_ts, msg.clone(), edit_ts).await
+            {
+                error!(%e, "phase edit failed");
+            }
+        }
+    };
+    let (result, ()) = join(stream, edits).await;
+
+    let answer = match result {
         Ok(a) if !a.is_empty() => a,
         Ok(_) => "(empty response)".to_string(),
         Err(e) => {
@@ -173,12 +198,12 @@ async fn handle_trigger<S: Store>(
         }
     };
 
-    let edit_ts = now_ts().max(thinking_ts + 1);
-    if let Err(e) = send_edit(manager, &recipient, thinking_ts, answer.clone(), edit_ts).await {
+    let edit_ts = now_ts().max(last_ts + 1);
+    if let Err(e) = send_edit(manager, &recipient, placeholder_ts, answer.clone(), edit_ts).await {
         error!(%e, "edit failed");
     }
 
-    Ok((thinking_ts, answer))
+    Ok((placeholder_ts, edit_ts, answer))
 }
 
 // handle a single received message: ignore anything that isn't a trigger, then
@@ -193,11 +218,16 @@ async fn process_content<S: Store>(
     let Some(t) = extract(content) else {
         return;
     };
+    // replying to one of the bot's own messages summons it without the trigger
+    let reply_to_ai = t.quoted_ts.is_some_and(|ts| replies.get(ts).is_some());
     let trimmed = t.body.trim_start();
-    let Some(rest) = trimmed.strip_prefix(&cfg.trigger) else {
+    let question = if let Some(rest) = trimmed.strip_prefix(&cfg.trigger) {
+        rest.trim()
+    } else if reply_to_ai {
+        t.body.trim()
+    } else {
         return;
     };
-    let question = rest.trim();
     let is_reply = t.quoted_text.is_some() || t.quoted_ts.is_some() || !t.quoted_thumbs.is_empty();
     // allow an image-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
@@ -218,7 +248,7 @@ async fn process_content<S: Store>(
         &t.thread,
         trigger_ts,
         cfg.context_messages,
-        &cfg.thinking_msg,
+        &cfg.processing_msg,
         names,
         replies,
     )
@@ -234,23 +264,38 @@ async fn process_content<S: Store>(
         "handling @ai prompt"
     );
     match handle_trigger(manager, cfg, recipient, trigger_ts, convo).await {
-        Ok((ts, answer)) => replies.record(ts, answer),
+        // record under both timestamps so a reply quoting either is recognised
+        Ok((ts, edit_ts, answer)) => {
+            replies.record(ts, answer.clone());
+            if edit_ts != ts {
+                replies.record(edit_ts, answer);
+            }
+        }
         Err(e) => error!(%e, "failed to handle prompt"),
     }
 }
 
+// whether the receive loop ended on its own or because the device was unlinked
+// and the caller should clear the store and re-link
+pub enum Outcome {
+    Done,
+    Relink,
+}
+
 pub async fn run_loop<S: Store>(
     mut manager: Manager<S, Registered>,
-    cfg: Config,
-    mut replies: AiReplies,
-) -> anyhow::Result<()> {
+    cfg: &Config,
+    replies: &mut AiReplies,
+) -> anyhow::Result<Outcome> {
     // resolve our own display name once up front (used to label our messages)
     let names = Names::resolve(&mut manager).await;
 
-    let messages = manager
-        .receive_messages()
-        .await
-        .context("failed to start message stream")?;
+    let messages = match manager.receive_messages().await {
+        Ok(m) => m,
+        // presage signals this when our device has been unlinked
+        Err(presage::Error::RelinkNecessary) => return Ok(Outcome::Relink),
+        Err(e) => return Err(e).context("failed to start message stream"),
+    };
     pin_mut!(messages);
 
     // don't answer the backlog that gets replayed on startup. only act on
@@ -267,9 +312,9 @@ pub async fn run_loop<S: Store>(
                 if !live {
                     continue;
                 }
-                process_content(&mut manager, &cfg, &names, &mut replies, &content).await;
+                process_content(&mut manager, cfg, &names, replies, &content).await;
             }
         }
     }
-    Ok(())
+    Ok(Outcome::Done)
 }

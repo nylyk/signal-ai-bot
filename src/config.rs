@@ -4,7 +4,9 @@ use crate::ai::AiClient;
 
 pub struct Config {
     pub trigger: String,
-    pub thinking_msg: String,
+    pub processing_msg: String,
+    pub reasoning_msg: String,
+    pub generating_msg: String,
     pub context_messages: usize,
     pub vision: bool,
     pub ai: AiClient,
@@ -20,8 +22,12 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         let trigger = std::env::var("TRIGGER").unwrap_or_else(|_| "@ai".to_string());
-        let thinking_msg =
-            std::env::var("THINKING_MESSAGE").unwrap_or_else(|_| "ai is thinking…".to_string());
+        let processing_msg =
+            std::env::var("PROCESSING_MESSAGE").unwrap_or_else(|_| "ai is reading...".to_string());
+        let reasoning_msg =
+            std::env::var("REASONING_MESSAGE").unwrap_or_else(|_| "ai is thinking...".to_string());
+        let generating_msg =
+            std::env::var("GENERATING_MESSAGE").unwrap_or_else(|_| "ai is writing...".to_string());
         let context_messages = std::env::var("CONTEXT_MESSAGES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -37,7 +43,9 @@ impl Config {
 
         Ok(Config {
             trigger,
-            thinking_msg,
+            processing_msg,
+            reasoning_msg,
+            generating_msg,
             context_messages,
             vision,
             ai: AiClient::new(base, key, model, system, reasoning_budget),

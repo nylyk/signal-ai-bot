@@ -9,7 +9,7 @@ mod recipient;
 mod replies;
 
 use futures::{channel::oneshot, future};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use presage::libsignal_service::configuration::SignalServers;
 use presage::manager::Registered;
@@ -19,8 +19,14 @@ use presage::Manager;
 use presage_store_sqlite::SqliteStore;
 
 use crate::config::Config;
-use crate::handler::run_loop;
+use crate::handler::{run_loop, Outcome};
 use crate::replies::AiReplies;
+
+async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
+    // left unencrypted: a passphrase passed via env would sit right next to the
+    // data it protects, so securing the volume is left to the host
+    Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
+}
 
 // no account is linked yet: print a qr code and wait for the phone to scan it,
 // then return the freshly-linked manager so the bot can start normally.
@@ -51,22 +57,28 @@ async fn link(
     Ok(manager)
 }
 
-async fn run(
-    store: SqliteStore,
-    db_path: String,
-    cfg: Config,
-    device_name: String,
-) -> anyhow::Result<()> {
-    // link on first run (shows the qr code), otherwise just load and go
-    let manager = if store.is_registered().await {
-        Manager::load_registered(store).await?
-    } else {
-        link(store, device_name).await?
-    };
-
+async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Result<()> {
     let replies_path = std::path::Path::new(&db_path).with_file_name("ai_replies.json");
-    let replies = AiReplies::load(replies_path);
-    run_loop(manager, cfg, replies).await
+    let mut replies = AiReplies::load(replies_path);
+
+    loop {
+        let store = open_store(&db_path).await?;
+        // link on first run (shows the qr code), otherwise just load and go
+        let manager = if store.is_registered().await {
+            Manager::load_registered(store).await?
+        } else {
+            link(store, device_name.clone()).await?
+        };
+
+        match run_loop(manager, &cfg, &mut replies).await? {
+            Outcome::Done => return Ok(()),
+            Outcome::Relink => {
+                warn!("device was unlinked; clearing registration to re-link");
+                let mut store = open_store(&db_path).await?;
+                store.clear_registration().await?;
+            }
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -93,11 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "signal-ai-bot".to_string());
 
-    // store is left unencrypted: a passphrase passed via env would sit right
-    // next to the data it protects, so it's left to the host/volume to secure.
-    let store = SqliteStore::open_with_passphrase(&db_path, None, OnNewIdentity::Trust).await?;
-
     // presage's Manager is !Send, so it has to run on a LocalSet
     let local = tokio::task::LocalSet::new();
-    local.run_until(run(store, db_path, cfg, device_name)).await
+    local.run_until(run(db_path, cfg, device_name)).await
 }
