@@ -6,6 +6,7 @@ pub struct Config {
     pub trigger: String,
     pub thinking_msg: String,
     pub context_messages: usize,
+    pub vision: bool,
     pub ai: AiClient,
 }
 
@@ -29,11 +30,16 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
+        let vision = std::env::var("VISION")
+            .ok()
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
 
         Ok(Config {
             trigger,
             thinking_msg,
             context_messages,
+            vision,
             ai: AiClient::new(base, key, model, system, reasoning_budget),
         })
     }

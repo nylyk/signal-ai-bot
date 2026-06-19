@@ -53,6 +53,7 @@ async fn build_convo<S: Store>(
     sender: &str,
     trigger: &Trigger,
     history: &[HistMsg],
+    vision: bool,
 ) -> (Vec<serde_json::Value>, usize) {
     let mut convo: Vec<serde_json::Value> = Vec::new();
     for h in history {
@@ -89,34 +90,39 @@ async fn build_convo<S: Store>(
     // model knows who is asking
     let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
 
-    // this message's own image attachments
-    let mut imgs = fetch_images(manager, &trigger.own_images).await;
+    let mut imgs = if vision {
+        fetch_images(manager, &trigger.own_images).await
+    } else {
+        Vec::new()
+    };
 
     // replied-to image: prefer the full-resolution original from the local
     // store, but fall back to the quote's embedded thumbnail whenever that
     // yields nothing — the original may not be stored, or its stored pointer
     // may not be downloadable
-    if let Some(qts) = trigger.quoted_ts {
-        let from_store = match manager.store().message(&trigger.thread, qts).await {
-            Ok(Some(orig)) => content_images(&orig),
-            _ => Vec::new(),
-        };
-        let mut reply_imgs = fetch_images(manager, &from_store).await;
-        let used_thumb = reply_imgs.is_empty();
-        if reply_imgs.is_empty() {
-            reply_imgs = fetch_images(manager, &trigger.quoted_thumbs).await;
+    if vision {
+        if let Some(qts) = trigger.quoted_ts {
+            let from_store = match manager.store().message(&trigger.thread, qts).await {
+                Ok(Some(orig)) => content_images(&orig),
+                _ => Vec::new(),
+            };
+            let mut reply_imgs = fetch_images(manager, &from_store).await;
+            let used_thumb = reply_imgs.is_empty();
+            if reply_imgs.is_empty() {
+                reply_imgs = fetch_images(manager, &trigger.quoted_thumbs).await;
+            }
+            info!(
+                store_ptrs = from_store.len(),
+                thumb_ptrs = trigger.quoted_thumbs.len(),
+                fetched = reply_imgs.len(),
+                used_thumb,
+                "resolved reply image"
+            );
+            imgs.extend(reply_imgs);
+        } else if !trigger.quoted_thumbs.is_empty() {
+            let thumbs = fetch_images(manager, &trigger.quoted_thumbs).await;
+            imgs.extend(thumbs);
         }
-        info!(
-            store_ptrs = from_store.len(),
-            thumb_ptrs = trigger.quoted_thumbs.len(),
-            fetched = reply_imgs.len(),
-            used_thumb,
-            "resolved reply image"
-        );
-        imgs.extend(reply_imgs);
-    } else if !trigger.quoted_thumbs.is_empty() {
-        let thumbs = fetch_images(manager, &trigger.quoted_thumbs).await;
-        imgs.extend(thumbs);
     }
 
     let image_count = imgs.len();
@@ -218,7 +224,7 @@ async fn process_content<S: Store>(
     )
     .await;
 
-    let (convo, images) = build_convo(manager, names, &sender, &t, &history).await;
+    let (convo, images) = build_convo(manager, names, &sender, &t, &history, cfg.vision).await;
 
     info!(
         thread = ?t.thread,

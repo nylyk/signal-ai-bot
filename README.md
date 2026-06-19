@@ -22,6 +22,7 @@ set via env vars (see `docker-compose.yml`):
 | `API_KEY`          | no       | empty             | api key (llama.cpp etc. need none)                 |
 | `MODEL`            | yes      | —                 | model id                                           |
 | `SYSTEM_PROMPT`    | no       | none              | system prompt                                      |
+| `VISION`           | no       | off               | send images — only enable for vision models        |
 | `TRIGGER`          | no       | `@ai`             | prefix that summons the bot                        |
 | `THINKING_MESSAGE` | no       | `ai is thinking…` | placeholder shown while generating                 |
 | `CONTEXT_MESSAGES` | no       | `5`               | recent messages fed as context                     |

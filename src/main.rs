@@ -99,7 +99,5 @@ async fn main() -> anyhow::Result<()> {
 
     // presage's Manager is !Send, so it has to run on a LocalSet
     let local = tokio::task::LocalSet::new();
-    local
-        .run_until(run(store, db_path, cfg, device_name))
-        .await
+    local.run_until(run(store, db_path, cfg, device_name)).await
 }
