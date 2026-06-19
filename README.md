@@ -28,7 +28,7 @@ set via env vars (see `docker-compose.yml`):
 | `REASONING_MESSAGE`  | no       | `ai is thinking...` | placeholder while the model reasons                |
 | `GENERATING_MESSAGE` | no       | `ai is writing...`  | placeholder while the model writes the answer      |
 | `CONTEXT_MESSAGES`   | no       | `5`                 | recent messages fed as context                     |
-| `REASONING_BUDGET`   | no       | `0`                 | `0` off, `N` token cap, `-1` unlimited (llama.cpp) |
+| `REASONING_BUDGET`   | no       | `0`                 | `0` off, `N` token cap, `-1` unlimited (llama.cpp)  |
 | `DEVICE_NAME`        | no       | `signal-ai-bot`     | name shown in signal's linked devices              |
 
 works with openai, openrouter, groq, local llama.cpp / ollama, or anything else

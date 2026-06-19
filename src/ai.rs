@@ -53,16 +53,20 @@ impl AiClient {
         messages.extend(convo);
 
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
-        // budget 0 disables thinking; the template kwarg is sent too since on some
-        // models the budget alone isn't enough (llama.cpp; ignored elsewhere).
-        let budget = self.reasoning_budget;
-        let body = serde_json::json!({
+        let thinking = self.reasoning_budget != 0;
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages,
             "stream": true,
-            "reasoning_budget": budget,
-            "chat_template_kwargs": { "enable_thinking": budget != 0 },
+            "chat_template_kwargs": { "enable_thinking": thinking },
         });
+        // a positive budget caps thinking to that many tokens (llama.cpp), which
+        // needs reasoning control on; negative means unlimited, 0 is off (above)
+        if self.reasoning_budget > 0 {
+            body["reasoning_control"] = serde_json::json!(true);
+            body["reasoning_format"] = serde_json::json!("auto");
+            body["thinking_budget_tokens"] = serde_json::json!(self.reasoning_budget);
+        }
 
         let resp = self
             .http
