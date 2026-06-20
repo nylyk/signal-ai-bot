@@ -118,11 +118,35 @@ impl AiClient {
             }
         }
 
-        Ok(visible_answer(&content)
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string())
+        Ok(stitched_answer(&content))
     }
+}
+
+// the answer with reasoning removed. the prompt opens the first <think> for the
+// model, so content can start inside reasoning with only a closing </think>;
+// drop that leading block, then strip any further explicit <think>…</think>
+// blocks (the model may re-enter reasoning between answer segments).
+fn stitched_answer(content: &str) -> String {
+    let mut rest = content;
+    if let Some(close) = rest.find("</think>") {
+        if rest.find("<think>").is_none_or(|open| close < open) {
+            rest = &rest[close + "</think>".len()..];
+        }
+    }
+    let mut out = String::new();
+    loop {
+        let Some(open) = rest.find("<think>") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        let after = &rest[open + "<think>".len()..];
+        match after.find("</think>") {
+            Some(close) => rest = &after[close + "</think>".len()..],
+            None => break,
+        }
+    }
+    out.trim().to_string()
 }
 
 // the phase implied by what's arrived so far: any visible (non-reasoning) text

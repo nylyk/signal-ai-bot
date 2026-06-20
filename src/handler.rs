@@ -1,7 +1,8 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
+use tokio::time::{sleep, Duration};
 use presage::libsignal_service::content::DataMessage;
 use presage::manager::Registered;
 use presage::model::messages::Received;
@@ -166,6 +167,11 @@ async fn handle_trigger<S: Store>(
     };
     send_to(manager, &recipient, placeholder.into(), placeholder_ts).await?;
 
+    // space consecutive edits: some clients drop an edit that arrives before
+    // they've stored the message it targets, rendering it as a separate message
+    const EDIT_GAP: Duration = Duration::from_millis(750);
+    let mut last_edit_at = Instant::now();
+
     // stream the completion: the ai side reports phase changes over the channel,
     // and we edit the placeholder to the matching status message as they arrive
     let (tx, mut rx) = mpsc::unbounded();
@@ -174,17 +180,31 @@ async fn handle_trigger<S: Store>(
         let _ = tx.unbounded_send(p);
     });
     let edits = async {
-        while let Some(phase) = rx.next().await {
+        let mut shown: Option<Phase> = None;
+        while let Some(mut phase) = rx.next().await {
+            if let Some(rem) = EDIT_GAP.checked_sub(last_edit_at.elapsed()) {
+                sleep(rem).await;
+            }
+            // after waiting, skip to the newest phase if more piled up
+            while let Ok(p) = rx.try_recv() {
+                phase = p;
+            }
+            if shown == Some(phase) {
+                continue;
+            }
+            shown = Some(phase);
             let msg = match phase {
                 Phase::Reasoning => &cfg.reasoning_msg,
                 Phase::Generating => &cfg.generating_msg,
             };
+            // each edit targets the previous revision, not the original, or the
+            // client renders it as a separate message
             let edit_ts = now_ts().max(last_ts + 1);
-            last_ts = edit_ts;
-            if let Err(e) = send_edit(manager, &recipient, placeholder_ts, msg.clone(), edit_ts).await
-            {
+            if let Err(e) = send_edit(manager, &recipient, last_ts, msg.clone(), edit_ts).await {
                 error!(%e, "phase edit failed");
             }
+            last_ts = edit_ts;
+            last_edit_at = Instant::now();
         }
     };
     let (result, ()) = join(stream, edits).await;
@@ -198,8 +218,11 @@ async fn handle_trigger<S: Store>(
         }
     };
 
+    if let Some(rem) = EDIT_GAP.checked_sub(last_edit_at.elapsed()) {
+        sleep(rem).await;
+    }
     let edit_ts = now_ts().max(last_ts + 1);
-    if let Err(e) = send_edit(manager, &recipient, placeholder_ts, answer.clone(), edit_ts).await {
+    if let Err(e) = send_edit(manager, &recipient, last_ts, answer.clone(), edit_ts).await {
         error!(%e, "edit failed");
     }
 

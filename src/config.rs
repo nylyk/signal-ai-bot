@@ -22,8 +22,8 @@ impl Config {
             .filter(|s| !s.is_empty());
 
         let trigger = std::env::var("TRIGGER").unwrap_or_else(|_| "@ai".to_string());
-        let processing_msg =
-            std::env::var("PROCESSING_MESSAGE").unwrap_or_else(|_| "ai is reading...".to_string());
+        let processing_msg = std::env::var("PROCESSING_MESSAGE")
+            .unwrap_or_else(|_| "ai is processing...".to_string());
         let reasoning_msg =
             std::env::var("REASONING_MESSAGE").unwrap_or_else(|_| "ai is thinking...".to_string());
         let generating_msg =
@@ -38,7 +38,12 @@ impl Config {
             .unwrap_or(0);
         let vision = std::env::var("VISION")
             .ok()
-            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .map(|s| {
+                matches!(
+                    s.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(false);
 
         Ok(Config {

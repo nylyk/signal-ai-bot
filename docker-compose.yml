@@ -11,11 +11,11 @@ services:
       MODEL: qwen3.6
       SYSTEM_PROMPT: you are a helpful assistant
       TRIGGER: "@ai"
-      PROCESSING_MESSAGE: ai is reading...
+      PROCESSING_MESSAGE: ai is processing...
       REASONING_MESSAGE: ai is thinking...
       GENERATING_MESSAGE: ai is writing...
       CONTEXT_MESSAGES: 10
-      REASONING_BUDGET: 200
+      REASONING_BUDGET: 0
       DEVICE_NAME: signal-ai-bot-dev
     volumes:
       - ./data:/data
