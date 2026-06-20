@@ -2,12 +2,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
-use tokio::time::{sleep, Duration};
 use presage::libsignal_service::content::DataMessage;
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, Store};
 use presage::Manager;
+use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
 use crate::ai::Phase;
@@ -26,9 +26,6 @@ fn now_ts() -> u64 {
         .as_millis() as u64
 }
 
-// render a user turn as `<speaker>: <body>`, prefixed with a reply annotation
-// naming who is being replied to (and their quoted text) when present, so the
-// model can tell people apart and follow reply chains.
 fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> String {
     let mut s = String::new();
     if let Some(r) = reply_to {
@@ -46,9 +43,6 @@ fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> S
     s
 }
 
-// build the chat-completions message array: each past message is its own turn
-// (assistant for the bot, user otherwise), the current question last, with any
-// images attached to that final turn as openai-style image_url parts.
 async fn build_convo<S: Store>(
     manager: &mut Manager<S, Registered>,
     names: &Names,
@@ -67,11 +61,7 @@ async fn build_convo<S: Store>(
         }
     }
 
-    // resolve who this message is replying to (text comes from the quote itself)
-    let is_reply = trigger.quoted_author.is_some()
-        || trigger.quoted_ts.is_some()
-        || trigger.quoted_text.is_some();
-    let reply_to = if is_reply {
+    let reply_to = if trigger.is_reply() {
         let author = resolve_author(
             manager,
             names,
@@ -87,9 +77,8 @@ async fn build_convo<S: Store>(
     } else {
         None
     };
-    // keep the @ai prefix so this message looks like the past trigger messages
-    // in the context, rather than a stripped one; prefix the asker's name so the
-    // model knows who is asking
+    // keep the @ai prefix so this turn matches the past trigger messages in
+    // context rather than looking stripped
     let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
 
     let mut imgs = if vision {
@@ -111,18 +100,18 @@ async fn build_convo<S: Store>(
             let mut reply_imgs = fetch_images(manager, &from_store).await;
             let used_thumb = reply_imgs.is_empty();
             if reply_imgs.is_empty() {
-                reply_imgs = fetch_images(manager, &trigger.quoted_thumbs).await;
+                reply_imgs = fetch_images(manager, &trigger.quoted_thumbnails).await;
             }
             info!(
                 store_ptrs = from_store.len(),
-                thumb_ptrs = trigger.quoted_thumbs.len(),
+                thumb_ptrs = trigger.quoted_thumbnails.len(),
                 fetched = reply_imgs.len(),
                 used_thumb,
                 "resolved reply image"
             );
             imgs.extend(reply_imgs);
-        } else if !trigger.quoted_thumbs.is_empty() {
-            let thumbs = fetch_images(manager, &trigger.quoted_thumbs).await;
+        } else if !trigger.quoted_thumbnails.is_empty() {
+            let thumbs = fetch_images(manager, &trigger.quoted_thumbnails).await;
             imgs.extend(thumbs);
         }
     }
@@ -144,11 +133,10 @@ async fn build_convo<S: Store>(
     (convo, image_count)
 }
 
-// post the placeholder, stream the completion while editing the placeholder to
-// reflect each phase (processing -> reasoning -> generating), then edit it into
-// the answer. returns the placeholder's and the final edit's sent-timestamps
-// plus the answer so the caller can record it under both (presage won't persist
-// these edits, and a reply may quote either timestamp).
+// post the placeholder, edit it through each phase as the completion streams,
+// then edit it into the answer. returns the placeholder and final-edit
+// timestamps plus the answer, so the caller can record it under both (presage
+// won't persist these edits, and a reply may quote either timestamp).
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
@@ -172,8 +160,6 @@ async fn handle_trigger<S: Store>(
     const EDIT_GAP: Duration = Duration::from_millis(750);
     let mut last_edit_at = Instant::now();
 
-    // stream the completion: the ai side reports phase changes over the channel,
-    // and we edit the placeholder to the matching status message as they arrive
     let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
     let stream = cfg.ai.complete(convo, move |p| {
@@ -229,8 +215,6 @@ async fn handle_trigger<S: Store>(
     Ok((placeholder_ts, edit_ts, answer))
 }
 
-// handle a single received message: ignore anything that isn't a trigger, then
-// gather context, build the prompt, and answer.
 async fn process_content<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
@@ -251,20 +235,16 @@ async fn process_content<S: Store>(
     } else {
         return;
     };
-    let is_reply = t.quoted_text.is_some() || t.quoted_ts.is_some() || !t.quoted_thumbs.is_empty();
+    let is_reply = t.is_reply();
     // allow an image-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
     if question.is_empty() && t.own_images.is_empty() && !is_reply {
         return;
     }
-    let Some(recipient) = Recipient::from_thread(&t.thread) else {
-        return;
-    };
+    let recipient = Recipient::from_thread(&t.thread);
 
-    // who is asking, so the model can be told and the trigger turn labelled
     let sender = names.of(manager, &content.metadata.sender).await;
 
-    // gather recent thread context (excludes the @ai message itself)
     let trigger_ts = content.timestamp();
     let history = thread_history(
         manager,
@@ -298,8 +278,6 @@ async fn process_content<S: Store>(
     }
 }
 
-// whether the receive loop ended on its own or because the device was unlinked
-// and the caller should clear the store and re-link
 pub enum Outcome {
     Done,
     Relink,
@@ -310,7 +288,6 @@ pub async fn run_loop<S: Store>(
     cfg: &Config,
     replies: &mut AiReplies,
 ) -> anyhow::Result<Outcome> {
-    // resolve our own display name once up front (used to label our messages)
     let names = Names::resolve(&mut manager).await;
 
     let messages = match manager.receive_messages().await {

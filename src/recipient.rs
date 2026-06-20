@@ -12,10 +12,10 @@ pub enum Recipient {
 }
 
 impl Recipient {
-    pub fn from_thread(thread: &Thread) -> Option<Self> {
+    pub fn from_thread(thread: &Thread) -> Self {
         match thread {
-            Thread::Contact(sid) => Some(Recipient::Contact(*sid)),
-            Thread::Group(key) => Some(Recipient::Group(*key)),
+            Thread::Contact(sid) => Recipient::Contact(*sid),
+            Thread::Group(key) => Recipient::Group(*key),
         }
     }
 
@@ -49,7 +49,6 @@ pub async fn send_to<S: Store>(
     Ok(())
 }
 
-// send an edit of a previously-sent message
 pub async fn send_edit<S: Store>(
     manager: &mut Manager<S, Registered>,
     recipient: &Recipient,

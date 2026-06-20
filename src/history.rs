@@ -15,11 +15,10 @@ struct Entry {
     body: String,
 }
 
-// a resolved message for the prompt context
 pub struct HistMsg {
     pub is_ai: bool,
-    pub speaker: String,            // sender's display name (unused when is_ai)
-    pub reply_to: Option<ReplyRef>, // who/what this message replied to, if any
+    pub speaker: String,
+    pub reply_to: Option<ReplyRef>,
     pub text: String,
 }
 
@@ -85,7 +84,6 @@ pub async fn thread_history<S: Store>(
     let mut out: Vec<(u64, HistMsg)> = entries
         .into_iter()
         .map(|(root, e)| {
-            // our recorded answer is authoritative for the bot's own messages
             let (is_ai, text) = match replies.get(root) {
                 Some(answer) => (true, answer.to_string()),
                 None => (e.is_ai, e.body),

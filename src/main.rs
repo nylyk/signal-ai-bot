@@ -28,8 +28,6 @@ async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
 }
 
-// no account is linked yet: print a qr code and wait for the phone to scan it,
-// then return the freshly-linked manager so the bot can start normally.
 async fn link(
     store: SqliteStore,
     device_name: String,
@@ -63,7 +61,6 @@ async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Resul
 
     loop {
         let store = open_store(&db_path).await?;
-        // link on first run (shows the qr code), otherwise just load and go
         let manager = if store.is_registered().await {
             Manager::load_registered(store).await?
         } else {
@@ -94,7 +91,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env()?;
 
-    // linking state lives on the mounted /data volume
     let db_path = "/data/store.db3".to_string();
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent)?;

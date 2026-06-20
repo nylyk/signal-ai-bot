@@ -1,10 +1,5 @@
-// ---------------------------------------------------------------------------
-// openai-compatible client
-// ---------------------------------------------------------------------------
-
 use futures::StreamExt;
 
-// which stage the model is in, inferred from the streamed deltas
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Reasoning,
@@ -38,9 +33,8 @@ impl AiClient {
         }
     }
 
-    // stream a completion, calling `on_phase` when the model moves from reasoning
-    // to writing (so the caller can update its status message), and returning the
-    // visible answer once the stream ends. tokens themselves are never surfaced.
+    // stream a completion, calling `on_phase` at each reasoning→writing
+    // transition. only the final answer is returned; tokens are never surfaced.
     pub async fn complete(
         &self,
         convo: Vec<serde_json::Value>,
@@ -85,7 +79,7 @@ impl AiClient {
 
         'outer: while let Some(chunk) = stream.next().await {
             buf.extend_from_slice(&chunk?);
-            // server-sent events: one `data: <json>` per line, blank-line separated
+            // server-sent events: one `data: <json>` per line
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=nl).collect();
                 let line = String::from_utf8_lossy(&line);
@@ -149,9 +143,8 @@ fn stitched_answer(content: &str) -> String {
     out.trim().to_string()
 }
 
-// the phase implied by what's arrived so far: any visible (non-reasoning) text
-// means writing; reasoning before that means thinking; nothing visible yet means
-// neither (still prefilling).
+// the phase implied by what's arrived so far: visible text means writing,
+// reasoning before that means thinking, nothing yet means neither.
 fn next_phase(saw_reasoning: bool, content: &str) -> Option<Phase> {
     match visible_answer(content) {
         Some(s) if !s.trim().is_empty() => Some(Phase::Generating),
@@ -161,7 +154,6 @@ fn next_phase(saw_reasoning: bool, content: &str) -> Option<Phase> {
 }
 
 // the user-visible answer within content, hiding an in-progress <think> block
-// (for models that inline reasoning in the content field).
 fn visible_answer(content: &str) -> Option<&str> {
     if let Some(idx) = content.rfind("</think>") {
         Some(content[idx + "</think>".len()..].trim_start())

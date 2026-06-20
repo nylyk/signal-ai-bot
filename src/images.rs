@@ -19,7 +19,7 @@ fn to_loadable(mime: &str, data: Vec<u8>) -> Option<(String, Vec<u8>)> {
 }
 
 // download image attachments and base64-encode them as (mime, data) pairs,
-// skipping anything empty or undecodable so we never emit a broken data url
+// skipping anything empty or undecodable
 pub async fn fetch_images<S: Store>(
     manager: &mut Manager<S, Registered>,
     ptrs: &[AttachmentPointer],

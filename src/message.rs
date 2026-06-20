@@ -25,9 +25,8 @@ fn quote_author_uuid(quote: &Quote) -> Option<Uuid> {
         })
 }
 
-// display name of a replied-to message's author. prefers the aci carried by the
-// quote; if absent, falls back to the original message's sender, looked up in
-// the store by its sent-timestamp.
+// display name of a replied-to message's author: prefer the quote's aci, else
+// fall back to the original message's sender, looked up by sent-timestamp.
 pub async fn resolve_author<S: Store>(
     manager: &Manager<S, Registered>,
     names: &Names,
@@ -46,21 +45,28 @@ pub async fn resolve_author<S: Store>(
     "someone".to_string()
 }
 
-// a reference to the message a message is replying to
 pub struct ReplyRef {
-    pub author: String, // resolved name of the person being replied to
-    pub text: String,   // the quoted text (may be empty for media-only quotes)
+    pub author: String,
+    pub text: String,
 }
 
-// everything we need out of a triggering message
 pub struct Trigger {
     pub thread: Thread,
     pub body: String,
     pub quoted_text: Option<String>,
-    pub quoted_ts: Option<u64>, // sent-timestamp of the replied-to msg
-    pub quoted_author: Option<Uuid>, // aci of the replied-to message's author
-    pub quoted_thumbs: Vec<AttachmentPointer>, // low-res thumbnails from the quote
-    pub own_images: Vec<AttachmentPointer>, // images attached to this message
+    pub quoted_ts: Option<u64>,
+    pub quoted_author: Option<Uuid>,
+    pub quoted_thumbnails: Vec<AttachmentPointer>,
+    pub own_images: Vec<AttachmentPointer>,
+}
+
+impl Trigger {
+    pub fn is_reply(&self) -> bool {
+        self.quoted_text.is_some()
+            || self.quoted_ts.is_some()
+            || self.quoted_author.is_some()
+            || !self.quoted_thumbnails.is_empty()
+    }
 }
 
 fn image_pointers(atts: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
@@ -84,7 +90,6 @@ fn dm_images(dm: &DataMessage) -> Vec<AttachmentPointer> {
     ptrs
 }
 
-// image attachments on a stored message (either direction)
 pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
     match &content.body {
         ContentBody::DataMessage(dm) => dm_images(dm),
@@ -98,8 +103,7 @@ pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
     }
 }
 
-// pull the text body, reply info, and image attachments out of a message, for
-// both messages others send to us and ones we send ourselves (synced)
+// pull text, reply info, and images out of a message (sent or received)
 pub fn extract(content: &Content) -> Option<Trigger> {
     let thread = Thread::try_from(content).ok()?;
     let dm = match &content.body {
@@ -135,13 +139,11 @@ pub fn extract(content: &Content) -> Option<Trigger> {
         quoted_text,
         quoted_ts,
         quoted_author,
-        quoted_thumbs,
+        quoted_thumbnails: quoted_thumbs,
         own_images,
     })
 }
 
-// resolve a message's reply reference (quoted author name + text), if it quotes
-// another message
 async fn reply_ref<S: Store>(
     manager: &Manager<S, Registered>,
     names: &Names,
@@ -154,19 +156,19 @@ async fn reply_ref<S: Store>(
     Some(ReplyRef { author, text })
 }
 
-// one revision of a message
+// one revision of a message (original or edit)
 pub struct Version {
     pub own_ts: u64,
     pub target: Option<u64>,
-    pub is_ai: bool,                // started life as the bot's placeholder => an ai reply
-    pub speaker: String,            // resolved display name of the sender
-    pub reply_to: Option<ReplyRef>, // who/what this message replies to, if any
+    pub is_ai: bool,
+    pub speaker: String,
+    pub reply_to: Option<ReplyRef>,
     pub body: String,
 }
 
-// extract a text version (original or edit) from a stored message. `names`
-// resolves display names; `thinking` is the placeholder text used to recognise
-// the bot's own replies (they all start life as that placeholder before editing).
+// extract a text version (original or edit) from a stored message. `thinking` is
+// the placeholder text used to recognise the bot's own replies (they all start
+// life as that placeholder before editing).
 pub async fn message_version<S: Store>(
     manager: &Manager<S, Registered>,
     content: &Content,
