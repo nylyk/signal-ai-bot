@@ -13,7 +13,7 @@ use crate::ai::Phase;
 use crate::config::Config;
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
-use crate::message::{content_images, extract, resolve_author, ReplyRef, Trigger};
+use crate::message::{content_images, extract, resolve_author, resolve_mentions, ReplyRef, Trigger};
 use crate::names::Names;
 use crate::recipient::{send_edit, send_to, Recipient};
 use crate::replies::AiReplies;
@@ -29,7 +29,11 @@ fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> S
     let mut s = String::new();
     if let Some(r) = reply_to {
         s.push_str("[in reply to ");
-        s.push_str(&r.author);
+        if r.is_ai {
+            s.push_str("you");
+        } else {
+            s.push_str(&r.author);
+        }
         if !r.text.is_empty() {
             // collapse newlines so the quote stays on the annotation line
             s.push_str(&format!(", who wrote: \"{}\"", r.text.replace('\n', " ")));
@@ -47,6 +51,7 @@ async fn build_convo<S: Store>(
     names: &Names,
     sender: &str,
     trigger: &Trigger,
+    reply_to_ai: bool,
     history: &[HistMsg],
     vision: bool,
 ) -> (Vec<serde_json::Value>, usize) {
@@ -72,6 +77,7 @@ async fn build_convo<S: Store>(
         Some(ReplyRef {
             author,
             text: trigger.quoted_text.clone().unwrap_or_default(),
+            is_ai: reply_to_ai,
         })
     } else {
         None
@@ -129,16 +135,19 @@ async fn build_convo<S: Store>(
 }
 
 // post the placeholder, edit it through each phase as the completion streams,
-// then edit it into the answer. returns the placeholder and final-edit
-// timestamps plus the answer, so the caller can record it under both (presage
-// won't persist these edits, and a reply may quote either timestamp).
+// then edit it into the answer. returns every timestamp we wrote (placeholder,
+// each phase edit, final) plus the answer. presage persists these edits as
+// separate rows keyed by their own timestamp, so the caller records the answer
+// under all of them: that way any row of the chain is recognised as ours rather
+// than leaking back into context as an owner message.
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     recipient: Recipient,
     trigger_ts: u64,
     convo: Vec<serde_json::Value>,
-) -> anyhow::Result<(u64, u64, String)> {
+    chat_context: &str,
+) -> anyhow::Result<(Vec<u64>, String)> {
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
     let placeholder_ts = now_ts().max(trigger_ts + 1);
@@ -152,7 +161,8 @@ async fn handle_trigger<S: Store>(
 
     let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
-    let stream = cfg.ai.complete(convo, move |p| {
+    let mut sent_ts = vec![placeholder_ts];
+    let stream = cfg.ai.complete(convo, chat_context, move |p| {
         let _ = tx.unbounded_send(p);
     });
     let edits = async {
@@ -177,6 +187,7 @@ async fn handle_trigger<S: Store>(
                 error!(%e, "phase edit failed");
             }
             last_ts = edit_ts;
+            sent_ts.push(edit_ts);
         }
     };
     let (result, ()) = join(stream, edits).await;
@@ -194,8 +205,9 @@ async fn handle_trigger<S: Store>(
     if let Err(e) = send_edit(manager, &recipient, last_ts, answer.clone(), edit_ts).await {
         error!(%e, "edit failed");
     }
+    sent_ts.push(edit_ts);
 
-    Ok((placeholder_ts, edit_ts, answer))
+    Ok((sent_ts, answer))
 }
 
 async fn process_content<S: Store>(
@@ -205,23 +217,23 @@ async fn process_content<S: Store>(
     replies: &mut AiReplies,
     content: &presage::libsignal_service::content::Content,
 ) {
-    let Some(t) = extract(content) else {
+    let Some(mut t) = extract(content) else {
         return;
     };
+    // turn @-mention placeholders into "@[name]" so the model can read them
+    t.body = resolve_mentions(manager, names, &t.body, &t.body_ranges).await;
     // replying to one of the bot's own messages summons it without the trigger
     let reply_to_ai = t.quoted_ts.is_some_and(|ts| replies.get(ts).is_some());
-    let trimmed = t.body.trim_start();
-    let question = if let Some(rest) = trimmed.strip_prefix(&cfg.trigger) {
-        rest.trim()
-    } else if reply_to_ai {
-        t.body.trim()
-    } else {
+    // the trigger can appear anywhere in the message
+    let trimmed = t.body.trim();
+    if !trimmed.contains(&cfg.trigger) && !reply_to_ai {
         return;
-    };
+    }
     let is_reply = t.is_reply();
     // allow an image-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
-    if question.is_empty() && t.own_images.is_empty() && !is_reply {
+    let only_trigger = trimmed.is_empty() || trimmed == cfg.trigger;
+    if only_trigger && t.own_images.is_empty() && !is_reply {
         return;
     }
     let recipient = Recipient::from_thread(&t.thread);
@@ -240,7 +252,9 @@ async fn process_content<S: Store>(
     )
     .await;
 
-    let (convo, images) = build_convo(manager, names, &sender, &t, &history, cfg.vision).await;
+    let (convo, images) =
+        build_convo(manager, names, &sender, &t, reply_to_ai, &history, cfg.vision).await;
+    let chat_context = names.chat_context(manager, &t.thread).await;
 
     info!(
         thread = ?t.thread,
@@ -249,12 +263,13 @@ async fn process_content<S: Store>(
         context = history.len(),
         "handling @ai prompt"
     );
-    match handle_trigger(manager, cfg, recipient, trigger_ts, convo).await {
-        // record under both timestamps so a reply quoting either is recognised
-        Ok((ts, edit_ts, answer)) => {
-            replies.record(ts, answer.clone());
-            if edit_ts != ts {
-                replies.record(edit_ts, answer);
+    match handle_trigger(manager, cfg, recipient, trigger_ts, convo, &chat_context).await {
+        // record the answer under every timestamp we wrote (placeholder, each
+        // phase edit, final), so any persisted row of the chain is recognised as
+        // ours and a reply quoting any of them summons the bot
+        Ok((sent_ts, answer)) => {
+            for ts in sent_ts {
+                replies.record(ts, answer.clone());
             }
         }
         Err(e) => error!(%e, "failed to handle prompt"),

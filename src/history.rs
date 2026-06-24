@@ -43,7 +43,7 @@ pub async fn thread_history<S: Store>(
 
     let mut versions = Vec::new();
     for msg in iter.filter_map(Result::ok) {
-        if let Some(v) = message_version(manager, &msg, names, thinking).await {
+        if let Some(v) = message_version(manager, &msg, names, thinking, replies).await {
             // the store doesn't reliably honour the range's upper bound, so
             // drop the trigger message (and anything newer) ourselves
             if v.own_ts >= before_ts {
@@ -100,6 +100,11 @@ pub async fn thread_history<S: Store>(
         })
         .collect();
     out.sort_by_key(|(root, _)| *root);
+    // a single reply persists as a chain of rows (placeholder + phase edits +
+    // answer); when that chain fails to collapse into one entry above, several
+    // adjacent entries carry the same answer text. fold those back together so
+    // the reply shows up once.
+    out.dedup_by(|(_, b), (_, a)| a.is_ai && b.is_ai && a.text == b.text);
     let start = out.len().saturating_sub(n);
     out.split_off(start).into_iter().map(|(_, m)| m).collect()
 }

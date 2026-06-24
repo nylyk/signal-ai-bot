@@ -1,14 +1,16 @@
 use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
 use presage::libsignal_service::prelude::Uuid;
+use presage::libsignal_service::proto::body_range::AssociatedValue;
 use presage::libsignal_service::proto::data_message::Quote;
 use presage::libsignal_service::proto::sync_message::Sent;
-use presage::libsignal_service::proto::AttachmentPointer;
+use presage::libsignal_service::proto::{AttachmentPointer, BodyRange};
 use presage::manager::Registered;
 use presage::proto::{EditMessage, SyncMessage};
 use presage::store::{ContentExt, Store, Thread};
 use presage::Manager;
 
 use crate::names::Names;
+use crate::replies::AiReplies;
 
 // the aci of a quote's author. modern signal clients send it as raw bytes in
 // `author_aci_binary`; older ones use the `author_aci` uuid string. try both.
@@ -23,6 +25,51 @@ fn quote_author_uuid(quote: &Quote) -> Option<Uuid> {
                 .as_deref()
                 .and_then(|b| Uuid::from_slice(b).ok())
         })
+}
+
+// signal puts an OBJECT REPLACEMENT CHARACTER in the body for each @-mention;
+// body_ranges says which aci each one refers to
+const MENTION: char = '\u{FFFC}';
+
+// the aci a mention range points at (uuid string or 16-byte binary form)
+fn mention_aci(range: &BodyRange) -> Option<Uuid> {
+    match range.associated_value.as_ref()? {
+        AssociatedValue::MentionAci(s) => Uuid::parse_str(s).ok(),
+        AssociatedValue::MentionAciBinary(b) => Uuid::from_slice(b).ok(),
+        AssociatedValue::Style(_) => None,
+    }
+}
+
+// rewrite each `￼` mention placeholder as "@[name]" so the model sees who was
+// mentioned. placeholders map 1:1 to mention ranges in left-to-right order.
+pub async fn resolve_mentions<S: Store>(
+    manager: &Manager<S, Registered>,
+    names: &Names,
+    body: &str,
+    ranges: &[BodyRange],
+) -> String {
+    if !body.contains(MENTION) {
+        return body.to_string();
+    }
+    let mut mentions: Vec<(u32, Uuid)> = ranges
+        .iter()
+        .filter_map(|r| Some((r.start?, mention_aci(r)?)))
+        .collect();
+    mentions.sort_by_key(|(start, _)| *start);
+    // resolve names up front (async), then splice positionally
+    let mut tags = Vec::with_capacity(mentions.len());
+    for (_, aci) in &mentions {
+        tags.push(format!("@[{}]", names.of_uuid(manager, *aci).await));
+    }
+    let mut tags = tags.into_iter();
+    let mut out = String::with_capacity(body.len());
+    for ch in body.chars() {
+        match (ch == MENTION).then(|| tags.next()).flatten() {
+            Some(tag) => out.push_str(&tag),
+            None => out.push(ch),
+        }
+    }
+    out
 }
 
 // display name of a replied-to message's author: prefer the quote's aci, else
@@ -48,6 +95,8 @@ pub async fn resolve_author<S: Store>(
 pub struct ReplyRef {
     pub author: String,
     pub text: String,
+    // the quoted message is one of the bot's own AI replies
+    pub is_ai: bool,
 }
 
 pub struct Trigger {
@@ -58,6 +107,7 @@ pub struct Trigger {
     pub quoted_author: Option<Uuid>,
     pub quoted_thumbnails: Vec<AttachmentPointer>,
     pub own_images: Vec<AttachmentPointer>,
+    pub body_ranges: Vec<BodyRange>,
 }
 
 impl Trigger {
@@ -141,6 +191,7 @@ pub fn extract(content: &Content) -> Option<Trigger> {
         quoted_author,
         quoted_thumbnails: quoted_thumbs,
         own_images,
+        body_ranges: dm.body_ranges.clone(),
     })
 }
 
@@ -149,11 +200,19 @@ async fn reply_ref<S: Store>(
     names: &Names,
     thread: Option<&Thread>,
     dm: &DataMessage,
+    replies: &AiReplies,
 ) -> Option<ReplyRef> {
     let quote = dm.quote.as_ref()?;
-    let text = quote.text.clone().unwrap_or_default();
+    let text = resolve_mentions(
+        manager,
+        names,
+        &quote.text.clone().unwrap_or_default(),
+        &quote.body_ranges,
+    )
+    .await;
     let author = resolve_author(manager, names, thread, quote_author_uuid(quote), quote.id).await;
-    Some(ReplyRef { author, text })
+    let is_ai = quote.id.is_some_and(|ts| replies.get(ts).is_some());
+    Some(ReplyRef { author, text, is_ai })
 }
 
 // one revision of a message (original or edit)
@@ -174,6 +233,7 @@ pub async fn message_version<S: Store>(
     content: &Content,
     names: &Names,
     thinking: &str,
+    replies: &AiReplies,
 ) -> Option<Version> {
     // pull the relevant data message (and any edit target) out of the envelope
     let (target, dm): (Option<u64>, &DataMessage) = match &content.body {
@@ -210,9 +270,10 @@ pub async fn message_version<S: Store>(
     let from_me = matches!(&content.body, ContentBody::SynchronizeMessage(_))
         || content.metadata.sender.raw_uuid() == names.my_aci();
     let is_ai = from_me && target.is_none() && body == thinking;
+    let body = resolve_mentions(manager, names, &body, &dm.body_ranges).await;
     let speaker = names.of(manager, &content.metadata.sender).await;
     let thread = Thread::try_from(content).ok();
-    let reply_to = reply_ref(manager, names, thread.as_ref(), dm).await;
+    let reply_to = reply_ref(manager, names, thread.as_ref(), dm, replies).await;
     Some(Version {
         own_ts: content.timestamp(),
         target,

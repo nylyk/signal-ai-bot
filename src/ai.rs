@@ -39,11 +39,17 @@ impl AiClient {
     pub async fn complete(
         &self,
         convo: Vec<serde_json::Value>,
+        chat_context: &str,
         mut on_phase: impl FnMut(Phase),
     ) -> anyhow::Result<String> {
         let mut messages = Vec::new();
-        if let Some(sys) = &self.system {
-            messages.push(serde_json::json!({ "role": "system", "content": sys }));
+        let system = match &self.system {
+            Some(s) if !chat_context.is_empty() => format!("{s}\n\n{chat_context}"),
+            Some(s) => s.clone(),
+            None => chat_context.to_string(),
+        };
+        if !system.is_empty() {
+            messages.push(serde_json::json!({ "role": "system", "content": system }));
         }
         messages.extend(convo);
 
