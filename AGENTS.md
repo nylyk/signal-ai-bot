@@ -11,6 +11,9 @@ and follow the relevant one when its trigger matches the request.
   remove duplication, improve structure and naming, simplify, and strip
   unnecessary comments. Trigger: "clean up", "tidy", "refactor for quality",
   "deduplicate", "remove comments".
+- [`release`](agents/skills/release.md) — cut a new release: commit pending
+  changes, bump version in Cargo.toml, tag as vX.Y.Z, push everything. Trigger:
+  "release", "cut a release", "bump version", "publish a new version".
 
 ## House style
 

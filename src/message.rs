@@ -131,7 +131,7 @@ fn image_pointers(atts: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
 
 // image attachments of a message: regular image attachments plus a sticker's
 // image (stickers live in their own field, not in `attachments`)
-fn dm_images(dm: &DataMessage) -> Vec<AttachmentPointer> {
+pub(crate) fn dm_images(dm: &DataMessage) -> Vec<AttachmentPointer> {
     let mut ptrs = image_pointers(&dm.attachments);
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {
         ptrs.push(data);
@@ -223,7 +223,7 @@ async fn reply_ref<S: Store>(
 
 // pull the data message (and edit target, if any) out of a stored envelope.
 // returns None for non-text bodies, or an edit missing its target/message.
-fn data_message(content: &Content) -> Option<(Option<u64>, &DataMessage)> {
+pub(crate) fn data_message(content: &Content) -> Option<(Option<u64>, &DataMessage)> {
     Some(match &content.body {
         ContentBody::DataMessage(dm) => (None, dm),
         ContentBody::EditMessage(EditMessage {
@@ -253,7 +253,7 @@ fn data_message(content: &Content) -> Option<(Option<u64>, &DataMessage)> {
 }
 
 // a stored message is ours if it's a synced send, or its sender is our account
-fn from_me(content: &Content, my_aci: Uuid) -> bool {
+pub(crate) fn from_me(content: &Content, my_aci: Uuid) -> bool {
     matches!(&content.body, ContentBody::SynchronizeMessage(_))
         || content.metadata.sender.raw_uuid() == my_aci
 }
@@ -263,6 +263,37 @@ fn from_me(content: &Content, my_aci: Uuid) -> bool {
 // each revision its own row. a quote may reference any revision, so walk the
 // edit chain back to the original and check it's our placeholder — no separate
 // record needed.
+//
+// returns the root placeholder's timestamp when it is one of our replies (so
+// callers can read the quote link the placeholder carries), else None.
+pub async fn ai_root_ts<S: Store>(
+    manager: &Manager<S, Registered>,
+    names: &Names,
+    thread: &Thread,
+    ts: u64,
+    processing_msg: &str,
+) -> Option<u64> {
+    let mut ts = ts;
+    // bounded: a reply is at most placeholder + a few edits deep
+    for _ in 0..16 {
+        let Ok(Some(content)) = manager.store().message(thread, ts).await else {
+            return None;
+        };
+        if !from_me(&content, names.my_aci()) {
+            return None;
+        }
+        let (target, dm) = data_message(&content)?;
+        match target {
+            // an edit: follow it to the revision it targets
+            Some(t) => ts = t,
+            // the original: it's ours iff it's the placeholder
+            None => return (dm.body.as_deref() == Some(processing_msg)).then_some(ts),
+        }
+    }
+    None
+}
+
+// retained for callers that only need the boolean answer
 pub async fn is_ai_message<S: Store>(
     manager: &Manager<S, Registered>,
     names: &Names,
@@ -270,26 +301,9 @@ pub async fn is_ai_message<S: Store>(
     ts: u64,
     processing_msg: &str,
 ) -> bool {
-    let mut ts = ts;
-    // bounded: a reply is at most placeholder + a few edits deep
-    for _ in 0..16 {
-        let Ok(Some(content)) = manager.store().message(thread, ts).await else {
-            return false;
-        };
-        if !from_me(&content, names.my_aci()) {
-            return false;
-        }
-        let Some((target, dm)) = data_message(&content) else {
-            return false;
-        };
-        match target {
-            // an edit: follow it to the revision it targets
-            Some(t) => ts = t,
-            // the original: it's ours iff it's the placeholder
-            None => return dm.body.as_deref() == Some(processing_msg),
-        }
-    }
-    false
+    ai_root_ts(manager, names, thread, ts, processing_msg)
+        .await
+        .is_some()
 }
 
 // one revision of a message (original or edit)

@@ -1,4 +1,5 @@
 use presage::libsignal_service::content::{ContentBody, DataMessage, GroupContextV2};
+use presage::libsignal_service::proto::data_message::Quote;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::zkgroup::GroupMasterKeyBytes;
 use presage::manager::Registered;
@@ -55,11 +56,13 @@ pub async fn send_edit<S: Store>(
     target_ts: u64,
     text: String,
     edit_ts: u64,
+    quote: Option<Quote>,
 ) -> anyhow::Result<()> {
     let edited = DataMessage {
         body: Some(text),
         timestamp: Some(edit_ts),
         group_v2: recipient.group_context(),
+        quote,
         ..Default::default()
     };
     let edit = EditMessage {
