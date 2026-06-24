@@ -6,7 +6,6 @@ mod images;
 mod message;
 mod names;
 mod recipient;
-mod replies;
 
 use futures::{channel::oneshot, future};
 use tracing::{error, info, warn};
@@ -20,7 +19,6 @@ use presage_store_sqlite::SqliteStore;
 
 use crate::config::Config;
 use crate::handler::{run_loop, Outcome};
-use crate::replies::AiReplies;
 
 async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     // left unencrypted: a passphrase passed via env would sit right next to the
@@ -56,9 +54,6 @@ async fn link(
 }
 
 async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Result<()> {
-    let replies_path = std::path::Path::new(&db_path).with_file_name("ai_replies.json");
-    let mut replies = AiReplies::load(replies_path);
-
     loop {
         let store = open_store(&db_path).await?;
         let manager = if store.is_registered().await {
@@ -67,7 +62,7 @@ async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Resul
             link(store, device_name.clone()).await?
         };
 
-        match run_loop(manager, &cfg, &mut replies).await? {
+        match run_loop(manager, &cfg).await? {
             Outcome::Done => return Ok(()),
             Outcome::Relink => {
                 warn!("device was unlinked; clearing registration to re-link");

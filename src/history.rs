@@ -6,7 +6,6 @@ use presage::Manager;
 
 use crate::message::{message_version, ReplyRef};
 use crate::names::Names;
-use crate::replies::AiReplies;
 
 struct Entry {
     is_ai: bool,
@@ -23,16 +22,17 @@ pub struct HistMsg {
 }
 
 // last `n` text messages in the thread before `before_ts` (excludes the
-// triggering @ai message), oldest-first. the bot's own replies are pulled from
-// `replies` (since presage doesn't persist sent edits) and flagged as ai.
+// triggering @ai message), oldest-first. the bot's own replies live in the store
+// as a placeholder edited into the answer; the chain collapses to one entry,
+// flagged as ai via its placeholder root.
 pub async fn thread_history<S: Store>(
     manager: &Manager<S, Registered>,
     thread: &Thread,
     before_ts: u64,
     n: usize,
     thinking: &str,
+    status_msgs: &[&str],
     names: &Names,
-    replies: &AiReplies,
 ) -> Vec<HistMsg> {
     if n == 0 {
         return Vec::new();
@@ -43,7 +43,7 @@ pub async fn thread_history<S: Store>(
 
     let mut versions = Vec::new();
     for msg in iter.filter_map(Result::ok) {
-        if let Some(v) = message_version(manager, &msg, names, thinking, replies).await {
+        if let Some(v) = message_version(manager, &msg, names, thinking).await {
             // the store doesn't reliably honour the range's upper bound, so
             // drop the trigger message (and anything newer) ourselves
             if v.own_ts >= before_ts {
@@ -84,26 +84,24 @@ pub async fn thread_history<S: Store>(
     let mut out: Vec<(u64, HistMsg)> = entries
         .into_iter()
         .map(|(root, e)| {
-            let (is_ai, text) = match replies.get(root) {
-                Some(answer) => (true, answer.to_string()),
-                None => (e.is_ai, e.body),
-            };
             (
                 root,
                 HistMsg {
-                    is_ai,
+                    is_ai: e.is_ai,
                     speaker: e.speaker,
                     reply_to: e.reply_to,
-                    text,
+                    text: e.body,
                 },
             )
         })
         .collect();
+    // drop our own transient status lines: a reply whose final answer edit isn't
+    // in this window yet (e.g. a concurrent trigger) would otherwise collapse to
+    // a bare "thinking..."/"writing..." and surface as the bot's words
+    out.retain(|(_, m)| !(m.is_ai && status_msgs.contains(&m.text.as_str())));
     out.sort_by_key(|(root, _)| *root);
-    // a single reply persists as a chain of rows (placeholder + phase edits +
-    // answer); when that chain fails to collapse into one entry above, several
-    // adjacent entries carry the same answer text. fold those back together so
-    // the reply shows up once.
+    // a reply's chain collapses to one entry above; if it ever fails to,
+    // adjacent entries carry the same answer text, so fold them back together
     out.dedup_by(|(_, b), (_, a)| a.is_ai && b.is_ai && a.text == b.text);
     let start = out.len().saturating_sub(n);
     out.split_off(start).into_iter().map(|(_, m)| m).collect()

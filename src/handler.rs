@@ -13,10 +13,11 @@ use crate::ai::Phase;
 use crate::config::Config;
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
-use crate::message::{content_images, extract, resolve_author, resolve_mentions, ReplyRef, Trigger};
+use crate::message::{
+    content_images, extract, is_ai_message, resolve_author, resolve_mentions, ReplyRef, Trigger,
+};
 use crate::names::Names;
 use crate::recipient::{send_edit, send_to, Recipient};
-use crate::replies::AiReplies;
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -147,7 +148,7 @@ async fn handle_trigger<S: Store>(
     trigger_ts: u64,
     convo: Vec<serde_json::Value>,
     chat_context: &str,
-) -> anyhow::Result<(Vec<u64>, String)> {
+) -> anyhow::Result<()> {
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
     let placeholder_ts = now_ts().max(trigger_ts + 1);
@@ -161,7 +162,6 @@ async fn handle_trigger<S: Store>(
 
     let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
-    let mut sent_ts = vec![placeholder_ts];
     let stream = cfg.ai.complete(convo, chat_context, move |p| {
         let _ = tx.unbounded_send(p);
     });
@@ -187,7 +187,6 @@ async fn handle_trigger<S: Store>(
                 error!(%e, "phase edit failed");
             }
             last_ts = edit_ts;
-            sent_ts.push(edit_ts);
         }
     };
     let (result, ()) = join(stream, edits).await;
@@ -202,19 +201,17 @@ async fn handle_trigger<S: Store>(
     };
 
     let edit_ts = now_ts().max(last_ts + 1);
-    if let Err(e) = send_edit(manager, &recipient, last_ts, answer.clone(), edit_ts).await {
+    if let Err(e) = send_edit(manager, &recipient, last_ts, answer, edit_ts).await {
         error!(%e, "edit failed");
     }
-    sent_ts.push(edit_ts);
 
-    Ok((sent_ts, answer))
+    Ok(())
 }
 
 async fn process_content<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     names: &Names,
-    replies: &mut AiReplies,
     content: &presage::libsignal_service::content::Content,
 ) {
     let Some(mut t) = extract(content) else {
@@ -223,7 +220,10 @@ async fn process_content<S: Store>(
     // turn @-mention placeholders into "@[name]" so the model can read them
     t.body = resolve_mentions(manager, names, &t.body, &t.body_ranges).await;
     // replying to one of the bot's own messages summons it without the trigger
-    let reply_to_ai = t.quoted_ts.is_some_and(|ts| replies.get(ts).is_some());
+    let reply_to_ai = match t.quoted_ts {
+        Some(ts) => is_ai_message(manager, names, &t.thread, ts, &cfg.processing_msg).await,
+        None => false,
+    };
     // the trigger can appear anywhere in the message
     let trimmed = t.body.trim();
     if !trimmed.contains(&cfg.trigger) && !reply_to_ai {
@@ -247,8 +247,8 @@ async fn process_content<S: Store>(
         trigger_ts,
         cfg.context_messages,
         &cfg.processing_msg,
+        &[&cfg.processing_msg, &cfg.reasoning_msg, &cfg.generating_msg],
         names,
-        replies,
     )
     .await;
 
@@ -263,16 +263,8 @@ async fn process_content<S: Store>(
         context = history.len(),
         "handling @ai prompt"
     );
-    match handle_trigger(manager, cfg, recipient, trigger_ts, convo, &chat_context).await {
-        // record the answer under every timestamp we wrote (placeholder, each
-        // phase edit, final), so any persisted row of the chain is recognised as
-        // ours and a reply quoting any of them summons the bot
-        Ok((sent_ts, answer)) => {
-            for ts in sent_ts {
-                replies.record(ts, answer.clone());
-            }
-        }
-        Err(e) => error!(%e, "failed to handle prompt"),
+    if let Err(e) = handle_trigger(manager, cfg, recipient, trigger_ts, convo, &chat_context).await {
+        error!(%e, "failed to handle prompt");
     }
 }
 
@@ -284,7 +276,6 @@ pub enum Outcome {
 pub async fn run_loop<S: Store>(
     mut manager: Manager<S, Registered>,
     cfg: &Config,
-    replies: &mut AiReplies,
 ) -> anyhow::Result<Outcome> {
     let names = Names::resolve(&mut manager).await;
 
@@ -310,7 +301,7 @@ pub async fn run_loop<S: Store>(
                 if !live {
                     continue;
                 }
-                process_content(&mut manager, cfg, &names, replies, &content).await;
+                process_content(&mut manager, cfg, &names, &content).await;
             }
         }
     }

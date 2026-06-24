@@ -10,7 +10,6 @@ use presage::store::{ContentExt, Store, Thread};
 use presage::Manager;
 
 use crate::names::Names;
-use crate::replies::AiReplies;
 
 // the aci of a quote's author. modern signal clients send it as raw bytes in
 // `author_aci_binary`; older ones use the `author_aci` uuid string. try both.
@@ -200,7 +199,7 @@ async fn reply_ref<S: Store>(
     names: &Names,
     thread: Option<&Thread>,
     dm: &DataMessage,
-    replies: &AiReplies,
+    processing_msg: &str,
 ) -> Option<ReplyRef> {
     let quote = dm.quote.as_ref()?;
     let text = resolve_mentions(
@@ -211,8 +210,70 @@ async fn reply_ref<S: Store>(
     )
     .await;
     let author = resolve_author(manager, names, thread, quote_author_uuid(quote), quote.id).await;
-    let is_ai = quote.id.is_some_and(|ts| replies.get(ts).is_some());
+    let is_ai = match (thread, quote.id) {
+        (Some(thread), Some(ts)) => is_ai_message(manager, names, thread, ts, processing_msg).await,
+        _ => false,
+    };
     Some(ReplyRef { author, text, is_ai })
+}
+
+// is the stored message at `ts` one of the bot's own AI replies? a reply lives
+// in the store as a placeholder (body == processing_msg) edited into the answer,
+// each revision its own row. a quote may reference any revision, so walk the
+// edit chain back to the original and check it's our placeholder — no separate
+// record needed.
+pub async fn is_ai_message<S: Store>(
+    manager: &Manager<S, Registered>,
+    names: &Names,
+    thread: &Thread,
+    ts: u64,
+    processing_msg: &str,
+) -> bool {
+    let mut ts = ts;
+    // bounded: a reply is at most placeholder + a few edits deep
+    for _ in 0..16 {
+        let Ok(Some(content)) = manager.store().message(thread, ts).await else {
+            return false;
+        };
+        let from_me = matches!(&content.body, ContentBody::SynchronizeMessage(_))
+            || content.metadata.sender.raw_uuid() == names.my_aci();
+        if !from_me {
+            return false;
+        }
+        let (target, dm): (Option<u64>, &DataMessage) = match &content.body {
+            ContentBody::DataMessage(dm) => (None, dm),
+            ContentBody::SynchronizeMessage(SyncMessage {
+                sent: Some(Sent {
+                    message: Some(dm), ..
+                }),
+                ..
+            }) => (None, dm),
+            ContentBody::EditMessage(EditMessage {
+                target_sent_timestamp: Some(t),
+                data_message: Some(dm),
+            }) => (Some(*t), dm),
+            ContentBody::SynchronizeMessage(SyncMessage {
+                sent:
+                    Some(Sent {
+                        edit_message:
+                            Some(EditMessage {
+                                target_sent_timestamp: Some(t),
+                                data_message: Some(dm),
+                            }),
+                        ..
+                    }),
+                ..
+            }) => (Some(*t), dm),
+            _ => return false,
+        };
+        match target {
+            // an edit: follow it to the revision it targets
+            Some(t) => ts = t,
+            // the original: it's ours iff it's the placeholder
+            None => return dm.body.as_deref() == Some(processing_msg),
+        }
+    }
+    false
 }
 
 // one revision of a message (original or edit)
@@ -233,7 +294,6 @@ pub async fn message_version<S: Store>(
     content: &Content,
     names: &Names,
     thinking: &str,
-    replies: &AiReplies,
 ) -> Option<Version> {
     // pull the relevant data message (and any edit target) out of the envelope
     let (target, dm): (Option<u64>, &DataMessage) = match &content.body {
@@ -273,9 +333,16 @@ pub async fn message_version<S: Store>(
     let body = resolve_mentions(manager, names, &body, &dm.body_ranges).await;
     let speaker = names.of(manager, &content.metadata.sender).await;
     let thread = Thread::try_from(content).ok();
-    let reply_to = reply_ref(manager, names, thread.as_ref(), dm, replies).await;
+    let reply_to = reply_ref(manager, names, thread.as_ref(), dm, thinking).await;
+    // content.timestamp() returns the *target* for edits; we need this revision's
+    // own id (its envelope ts) so edit chains link by target instead of orphaning
+    let own_ts = if target.is_some() {
+        content.metadata.timestamp
+    } else {
+        content.timestamp()
+    };
     Some(Version {
-        own_ts: content.timestamp(),
+        own_ts,
         target,
         is_ai,
         speaker,
