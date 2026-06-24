@@ -252,8 +252,16 @@ async fn process_content<S: Store>(
     )
     .await;
 
-    let (convo, images) =
-        build_convo(manager, names, &sender, &t, reply_to_ai, &history, cfg.vision).await;
+    let (convo, images) = build_convo(
+        manager,
+        names,
+        &sender,
+        &t,
+        reply_to_ai,
+        &history,
+        cfg.vision,
+    )
+    .await;
     let chat_context = names.chat_context(manager, &t.thread).await;
 
     info!(
@@ -263,7 +271,8 @@ async fn process_content<S: Store>(
         context = history.len(),
         "handling @ai prompt"
     );
-    if let Err(e) = handle_trigger(manager, cfg, recipient, trigger_ts, convo, &chat_context).await {
+    if let Err(e) = handle_trigger(manager, cfg, recipient, trigger_ts, convo, &chat_context).await
+    {
         error!(%e, "failed to handle prompt");
     }
 }

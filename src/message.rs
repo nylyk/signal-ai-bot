@@ -214,7 +214,48 @@ async fn reply_ref<S: Store>(
         (Some(thread), Some(ts)) => is_ai_message(manager, names, thread, ts, processing_msg).await,
         _ => false,
     };
-    Some(ReplyRef { author, text, is_ai })
+    Some(ReplyRef {
+        author,
+        text,
+        is_ai,
+    })
+}
+
+// pull the data message (and edit target, if any) out of a stored envelope.
+// returns None for non-text bodies, or an edit missing its target/message.
+fn data_message(content: &Content) -> Option<(Option<u64>, &DataMessage)> {
+    Some(match &content.body {
+        ContentBody::DataMessage(dm) => (None, dm),
+        ContentBody::EditMessage(EditMessage {
+            target_sent_timestamp,
+            data_message,
+        }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
+        ContentBody::SynchronizeMessage(SyncMessage {
+            sent: Some(Sent {
+                message: Some(dm), ..
+            }),
+            ..
+        }) => (None, dm),
+        ContentBody::SynchronizeMessage(SyncMessage {
+            sent:
+                Some(Sent {
+                    edit_message:
+                        Some(EditMessage {
+                            target_sent_timestamp,
+                            data_message,
+                        }),
+                    ..
+                }),
+            ..
+        }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
+        _ => return None,
+    })
+}
+
+// a stored message is ours if it's a synced send, or its sender is our account
+fn from_me(content: &Content, my_aci: Uuid) -> bool {
+    matches!(&content.body, ContentBody::SynchronizeMessage(_))
+        || content.metadata.sender.raw_uuid() == my_aci
 }
 
 // is the stored message at `ts` one of the bot's own AI replies? a reply lives
@@ -235,36 +276,11 @@ pub async fn is_ai_message<S: Store>(
         let Ok(Some(content)) = manager.store().message(thread, ts).await else {
             return false;
         };
-        let from_me = matches!(&content.body, ContentBody::SynchronizeMessage(_))
-            || content.metadata.sender.raw_uuid() == names.my_aci();
-        if !from_me {
+        if !from_me(&content, names.my_aci()) {
             return false;
         }
-        let (target, dm): (Option<u64>, &DataMessage) = match &content.body {
-            ContentBody::DataMessage(dm) => (None, dm),
-            ContentBody::SynchronizeMessage(SyncMessage {
-                sent: Some(Sent {
-                    message: Some(dm), ..
-                }),
-                ..
-            }) => (None, dm),
-            ContentBody::EditMessage(EditMessage {
-                target_sent_timestamp: Some(t),
-                data_message: Some(dm),
-            }) => (Some(*t), dm),
-            ContentBody::SynchronizeMessage(SyncMessage {
-                sent:
-                    Some(Sent {
-                        edit_message:
-                            Some(EditMessage {
-                                target_sent_timestamp: Some(t),
-                                data_message: Some(dm),
-                            }),
-                        ..
-                    }),
-                ..
-            }) => (Some(*t), dm),
-            _ => return false,
+        let Some((target, dm)) = data_message(&content) else {
+            return false;
         };
         match target {
             // an edit: follow it to the revision it targets
@@ -296,40 +312,12 @@ pub async fn message_version<S: Store>(
     thinking: &str,
 ) -> Option<Version> {
     // pull the relevant data message (and any edit target) out of the envelope
-    let (target, dm): (Option<u64>, &DataMessage) = match &content.body {
-        ContentBody::DataMessage(dm) => (None, dm),
-        ContentBody::EditMessage(EditMessage {
-            target_sent_timestamp,
-            data_message,
-        }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
-        ContentBody::SynchronizeMessage(SyncMessage {
-            sent: Some(Sent {
-                message: Some(dm), ..
-            }),
-            ..
-        }) => (None, dm),
-        ContentBody::SynchronizeMessage(SyncMessage {
-            sent:
-                Some(Sent {
-                    edit_message:
-                        Some(EditMessage {
-                            target_sent_timestamp,
-                            data_message,
-                        }),
-                    ..
-                }),
-            ..
-        }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
-        _ => return None,
-    };
+    let (target, dm) = data_message(content)?;
     let body = dm.body.clone()?;
     if body.is_empty() {
         return None;
     }
-    // synced sends are ours; direct sends are ours iff the sender is our account
-    let from_me = matches!(&content.body, ContentBody::SynchronizeMessage(_))
-        || content.metadata.sender.raw_uuid() == names.my_aci();
-    let is_ai = from_me && target.is_none() && body == thinking;
+    let is_ai = from_me(content, names.my_aci()) && target.is_none() && body == thinking;
     let body = resolve_mentions(manager, names, &body, &dm.body_ranges).await;
     let speaker = names.of(manager, &content.metadata.sender).await;
     let thread = Thread::try_from(content).ok();
