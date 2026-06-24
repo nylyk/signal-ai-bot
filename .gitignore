@@ -1,7 +1,7 @@
 # rust build artifacts
 /target
 
-# environment / secrets (AI_API_KEY etc.)
+# environment / secrets (API_KEY etc.)
 .env
 .env.*
 /data

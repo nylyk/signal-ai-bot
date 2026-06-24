@@ -1,4 +1,4 @@
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
@@ -7,7 +7,6 @@ use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, Store};
 use presage::Manager;
-use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 
 use crate::ai::Phase;
@@ -81,17 +80,14 @@ async fn build_convo<S: Store>(
     // context rather than looking stripped
     let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
 
-    let mut imgs = if vision {
-        fetch_images(manager, &trigger.own_images).await
-    } else {
-        Vec::new()
-    };
-
-    // replied-to image: prefer the full-resolution original from the local
-    // store, but fall back to the quote's embedded thumbnail whenever that
-    // yields nothing — the original may not be stored, or its stored pointer
-    // may not be downloadable
+    let mut imgs = Vec::new();
     if vision {
+        imgs.extend(fetch_images(manager, &trigger.own_images).await);
+
+        // replied-to image: prefer the full-resolution original from the local
+        // store, but fall back to the quote's embedded thumbnail whenever that
+        // yields nothing — the original may not be stored, or its stored pointer
+        // may not be downloadable
         if let Some(qts) = trigger.quoted_ts {
             let from_store = match manager.store().message(&trigger.thread, qts).await {
                 Ok(Some(orig)) => content_images(&orig),
@@ -111,8 +107,7 @@ async fn build_convo<S: Store>(
             );
             imgs.extend(reply_imgs);
         } else if !trigger.quoted_thumbnails.is_empty() {
-            let thumbs = fetch_images(manager, &trigger.quoted_thumbnails).await;
-            imgs.extend(thumbs);
+            imgs.extend(fetch_images(manager, &trigger.quoted_thumbnails).await);
         }
     }
 
@@ -155,11 +150,6 @@ async fn handle_trigger<S: Store>(
     };
     send_to(manager, &recipient, placeholder.into(), placeholder_ts).await?;
 
-    // space consecutive edits: some clients drop an edit that arrives before
-    // they've stored the message it targets, rendering it as a separate message
-    const EDIT_GAP: Duration = Duration::from_millis(750);
-    let mut last_edit_at = Instant::now();
-
     let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
     let stream = cfg.ai.complete(convo, move |p| {
@@ -168,10 +158,7 @@ async fn handle_trigger<S: Store>(
     let edits = async {
         let mut shown: Option<Phase> = None;
         while let Some(mut phase) = rx.next().await {
-            if let Some(rem) = EDIT_GAP.checked_sub(last_edit_at.elapsed()) {
-                sleep(rem).await;
-            }
-            // after waiting, skip to the newest phase if more piled up
+            // skip to the newest phase if more piled up
             while let Ok(p) = rx.try_recv() {
                 phase = p;
             }
@@ -190,7 +177,6 @@ async fn handle_trigger<S: Store>(
                 error!(%e, "phase edit failed");
             }
             last_ts = edit_ts;
-            last_edit_at = Instant::now();
         }
     };
     let (result, ()) = join(stream, edits).await;
@@ -204,9 +190,6 @@ async fn handle_trigger<S: Store>(
         }
     };
 
-    if let Some(rem) = EDIT_GAP.checked_sub(last_edit_at.elapsed()) {
-        sleep(rem).await;
-    }
     let edit_ts = now_ts().max(last_ts + 1);
     if let Err(e) = send_edit(manager, &recipient, last_ts, answer.clone(), edit_ts).await {
         error!(%e, "edit failed");

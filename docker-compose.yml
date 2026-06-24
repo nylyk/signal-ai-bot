@@ -6,6 +6,7 @@ services:
     # (when deploying you would want them to be in the same network)
     network_mode: host
     environment:
+      RUST_LOG: signal_ai_bot=debug
       API_BASE: http://localhost:8080/v1
       API_KEY: not-needed
       MODEL: qwen3.6
