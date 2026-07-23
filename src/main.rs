@@ -9,10 +9,12 @@ mod names;
 mod prune;
 mod recipient;
 
+use anyhow::Context as _;
 use futures::{channel::oneshot, future};
 use tracing::{error, info, warn};
 
 use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::prelude::ServiceError;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::store::StateStore;
@@ -26,6 +28,20 @@ async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     // left unencrypted: a passphrase passed via env would sit right next to the
     // data it protects, so securing the volume is left to the host
     Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
+}
+
+// signal answers the link request with a 409 when the account's device list is
+// still in flux — most commonly right after a device was unlinked. it clears on
+// its own after a short while, so it's worth telling the user to retry rather
+// than surfacing a bare "409".
+fn is_link_conflict<E: std::error::Error>(e: &presage::Error<E>) -> bool {
+    matches!(
+        e,
+        presage::Error::ServiceError(
+            ServiceError::MismatchedDevicesException(_)
+                | ServiceError::UnhandledResponseCode { http_code: 409 }
+        )
+    )
 }
 
 async fn link(
@@ -49,7 +65,17 @@ async fn link(
     )
     .await;
 
-    let manager = manager?;
+    let manager = match manager {
+        Ok(m) => m,
+        Err(e) if is_link_conflict(&e) => {
+            return Err(e).context(
+                "signal rejected the link with a 409 conflict. this usually happens when the \
+                 account was just unlinked — signal needs a few minutes before it will accept a \
+                 new link. wait a bit, then start the bot again to retry",
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
     let whoami = manager.whoami().await?;
     info!("linked. account: {whoami:?}");
     Ok(manager)
