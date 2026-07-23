@@ -6,6 +6,7 @@ mod history;
 mod images;
 mod message;
 mod names;
+mod prune;
 mod recipient;
 
 use futures::{channel::oneshot, future};

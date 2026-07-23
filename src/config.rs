@@ -9,6 +9,9 @@ pub struct Config {
     pub generating_msg: String,
     pub context_messages: usize,
     pub vision: bool,
+    // how old a message may get before it's pruned from the store, in ms.
+    // `None` keeps history forever.
+    pub retention: Option<u64>,
     pub ai: AiClient,
 }
 
@@ -32,6 +35,12 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
+        // days of history to keep; 0 disables pruning. default 7.
+        let retention = std::env::var("MESSAGE_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(7);
+        let retention = (retention != 0).then(|| retention * 24 * 60 * 60 * 1000);
         let reasoning_budget = std::env::var("REASONING_BUDGET")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
@@ -53,6 +62,7 @@ impl Config {
             generating_msg,
             context_messages,
             vision,
+            retention,
             ai: AiClient::new(base, key, model, system, reasoning_budget),
         })
     }
