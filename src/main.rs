@@ -30,10 +30,8 @@ async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
 }
 
-// signal answers the link request with a 409 when the account's device list is
-// still in flux — most commonly right after a device was unlinked. it clears on
-// its own after a short while, so it's worth telling the user to retry rather
-// than surfacing a bare "409".
+// signal returns a 409 on linking for a stale device list (e.g. just after an
+// unlink) or a missing capability; explain it rather than surface a bare code.
 fn is_link_conflict<E: std::error::Error>(e: &presage::Error<E>) -> bool {
     matches!(
         e,
@@ -69,9 +67,11 @@ async fn link(
         Ok(m) => m,
         Err(e) if is_link_conflict(&e) => {
             return Err(e).context(
-                "signal rejected the link with a 409 conflict. this usually happens when the \
-                 account was just unlinked — signal needs a few minutes before it will accept a \
-                 new link. wait a bit, then start the bot again to retry",
+                "Signal rejected the link request with a 409 conflict. This typically means the \
+                 account's device list is briefly inconsistent — most often just after a device \
+                 was unlinked — which clears on its own; wait a few minutes and restart the bot \
+                 to retry. It can also mean this client is missing a device capability the \
+                 account requires, which instead calls for updating to a current build.",
             );
         }
         Err(e) => return Err(e.into()),
