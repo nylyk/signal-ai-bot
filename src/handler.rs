@@ -24,7 +24,7 @@ use crate::prune::prune_old_messages;
 use crate::recipient::{send_edit, send_to, Recipient};
 
 // how many finished conversations to keep warm for continuation
-const CONVO_CACHE_CAP: usize = 64;
+const CONVO_CACHE_CAP: usize = 20;
 // how often to sweep the store for messages past the retention window
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
