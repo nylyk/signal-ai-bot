@@ -38,7 +38,7 @@ impl AiClient {
     // transition. only the final answer is returned; tokens are never surfaced.
     pub async fn complete(
         &self,
-        convo: Vec<serde_json::Value>,
+        convo: &[serde_json::Value],
         chat_context: &str,
         mut on_phase: impl FnMut(Phase),
     ) -> anyhow::Result<String> {
@@ -51,7 +51,7 @@ impl AiClient {
         if !system.is_empty() {
             messages.push(serde_json::json!({ "role": "system", "content": system }));
         }
-        messages.extend(convo);
+        messages.extend(convo.iter().cloned());
 
         let url = format!("{}/chat/completions", self.base.trim_end_matches('/'));
         let thinking = self.reasoning_budget != 0;

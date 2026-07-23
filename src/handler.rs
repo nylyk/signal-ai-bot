@@ -12,14 +12,18 @@ use tracing::{error, info};
 
 use crate::ai::Phase;
 use crate::config::Config;
+use crate::convo_cache::{Cached, ConvoCache};
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
 use crate::message::{
-    content_images, dm_images, extract, is_ai_message, resolve_author, resolve_mentions, ReplyRef,
+    ai_root_ts, content_images, extract, is_ai_message, resolve_author, resolve_mentions, ReplyRef,
     Trigger,
 };
 use crate::names::Names;
 use crate::recipient::{send_edit, send_to, Recipient};
+
+// how many finished conversations to keep warm for continuation
+const CONVO_CACHE_CAP: usize = 64;
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -49,27 +53,61 @@ fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> S
     s
 }
 
-async fn build_convo<S: Store>(
+// a `user` turn: plain string content when there are no images, else a
+// multimodal parts array with the text followed by each image as an image_url.
+fn user_turn_value(text: String, imgs: &[(String, String)]) -> serde_json::Value {
+    if imgs.is_empty() {
+        return serde_json::json!({ "role": "user", "content": text });
+    }
+    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+    for (mime, data) in imgs {
+        parts.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{mime};base64,{data}") }
+        }));
+    }
+    serde_json::json!({ "role": "user", "content": parts })
+}
+
+// turn a window of history into chat messages. the bot's own answers become
+// `assistant` turns; everyone else's become `user` turns carrying that message's
+// own images (fetched only when vision is on).
+async fn history_turns<S: Store>(
+    manager: &mut Manager<S, Registered>,
+    cfg: &Config,
+    history: &[HistMsg],
+) -> Vec<serde_json::Value> {
+    let mut turns = Vec::with_capacity(history.len());
+    for h in history {
+        if h.is_ai {
+            turns.push(serde_json::json!({ "role": "assistant", "content": h.text.clone() }));
+            continue;
+        }
+        let imgs = if cfg.vision {
+            fetch_images(manager, &h.images).await
+        } else {
+            Vec::new()
+        };
+        let text = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
+        turns.push(user_turn_value(text, &imgs));
+    }
+    turns
+}
+
+// the final `user` turn for the triggering message: its text plus its own
+// images. `window` is the set of turns already in the array; a directly-quoted
+// image is added only when the quoted message isn't already one of them (so an
+// in-window image isn't sent twice), covering replies to a photo from before the
+// window.
+async fn trigger_turn<S: Store>(
     manager: &mut Manager<S, Registered>,
     names: &Names,
     cfg: &Config,
     sender: &str,
     trigger: &Trigger,
     reply_to_ai: bool,
-    history: &[HistMsg],
-) -> (Vec<serde_json::Value>, usize) {
-    let vision = cfg.vision;
-    let processing_msg = cfg.processing_msg.as_str();
-    let mut convo: Vec<serde_json::Value> = Vec::new();
-    for h in history {
-        if h.is_ai {
-            convo.push(serde_json::json!({ "role": "assistant", "content": h.text.clone() }));
-        } else {
-            let content = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
-            convo.push(serde_json::json!({ "role": "user", "content": content }));
-        }
-    }
-
+    window: &[HistMsg],
+) -> (serde_json::Value, usize) {
     let reply_to = if trigger.is_reply() {
         let author = resolve_author(
             manager,
@@ -92,154 +130,56 @@ async fn build_convo<S: Store>(
     let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
 
     let mut imgs = Vec::new();
-    if vision {
+    if cfg.vision {
         imgs.extend(fetch_images(manager, &trigger.own_images).await);
 
-        // resolved images from the message the trigger replies to (if any):
+        // a directly-quoted image the model can't already see in this window:
         // prefer the full-resolution original from the local store, fall back to
         // the quote's embedded thumbnail when that yields nothing
         if let Some(qts) = trigger.quoted_ts {
-            let from_store = match manager.store().message(&trigger.thread, qts).await {
-                Ok(Some(orig)) => content_images(&orig),
-                _ => Vec::new(),
-            };
-            let mut reply_imgs = fetch_images(manager, &from_store).await;
-            let used_thumb = reply_imgs.is_empty();
-            if reply_imgs.is_empty() {
-                reply_imgs = fetch_images(manager, &trigger.quoted_thumbnails).await;
+            if !window.iter().any(|h| h.ts == qts) {
+                let from_store = match manager.store().message(&trigger.thread, qts).await {
+                    Ok(Some(orig)) => content_images(&orig),
+                    _ => Vec::new(),
+                };
+                let mut reply_imgs = fetch_images(manager, &from_store).await;
+                let used_thumb = reply_imgs.is_empty();
+                if reply_imgs.is_empty() {
+                    reply_imgs = fetch_images(manager, &trigger.quoted_thumbnails).await;
+                }
+                info!(
+                    store_ptrs = from_store.len(),
+                    thumb_ptrs = trigger.quoted_thumbnails.len(),
+                    fetched = reply_imgs.len(),
+                    used_thumb,
+                    "resolved reply image"
+                );
+                imgs.extend(reply_imgs);
             }
-            info!(
-                store_ptrs = from_store.len(),
-                thumb_ptrs = trigger.quoted_thumbnails.len(),
-                fetched = reply_imgs.len(),
-                used_thumb,
-                "resolved reply image"
-            );
-            imgs.extend(reply_imgs);
         } else if !trigger.quoted_thumbnails.is_empty() {
             imgs.extend(fetch_images(manager, &trigger.quoted_thumbnails).await);
-        }
-
-        // recall: when the trigger is a reply to one of our own answers, walk
-        // the reply chain backwards to collect images from the originating
-        // trigger(s). each bot answer quotes its trigger, so the chain links
-        // answer -> trigger -> (earlier answer) -> ... bounded & cycle-guarded.
-        if reply_to_ai {
-            if let Some(qts) = trigger.quoted_ts {
-                let recalled =
-                    recall_chain_images(manager, names, &trigger.thread, qts, processing_msg).await;
-                if !recalled.is_empty() {
-                    info!(recalled = recalled.len(), "recalled chain images");
-                    imgs.extend(recalled);
-                }
-            }
         }
     }
 
     let image_count = imgs.len();
-    if imgs.is_empty() {
-        convo.push(serde_json::json!({ "role": "user", "content": q }));
-    } else {
-        let mut parts = vec![serde_json::json!({ "type": "text", "text": q })];
-        for (mime, data) in &imgs {
-            parts.push(serde_json::json!({
-                "type": "image_url",
-                "image_url": { "url": format!("data:{mime};base64,{data}") }
-            }));
-        }
-        convo.push(serde_json::json!({ "role": "user", "content": parts }));
-    }
-
-    (convo, image_count)
+    (user_turn_value(q, &imgs), image_count)
 }
 
-// walk the reply chain backwards from an AI answer to collect images from the
-// originating trigger(s). each bot answer quotes its trigger (set in
-// handle_trigger), and a trigger may itself reply to an earlier AI answer, so
-// the chain links: answer -> trigger -> (earlier answer) -> ... bounded by the
-// same 16-hop limit used elsewhere, and cycle-guarded with a visited set.
-async fn recall_chain_images<S: Store>(
+// a fresh conversation: the last-N window turned into turns, then the trigger
+async fn build_convo<S: Store>(
     manager: &mut Manager<S, Registered>,
     names: &Names,
-    thread: &presage::store::Thread,
-    start_ts: u64,
-    processing_msg: &str,
-) -> Vec<(String, String)> {
-    use std::collections::HashSet;
-
-    let mut imgs = Vec::new();
-    let mut visited: HashSet<u64> = HashSet::new();
-    let mut ts = start_ts;
-
-    for _ in 0..16 {
-        if !visited.insert(ts) {
-            break;
-        }
-        // resolve to the placeholder root if this is an edit of one of our
-        // answers; otherwise ts is a user message we inspect directly
-        let root_ts =
-            match crate::message::ai_root_ts(manager, names, thread, ts, processing_msg).await {
-                Some(r) => r,
-                None => ts,
-            };
-        if root_ts != ts {
-            // ts was an edit; jump to the root and re-check visited
-            ts = root_ts;
-            continue;
-        }
-        let Ok(Some(content)) = manager.store().message(thread, ts).await else {
-            break;
-        };
-        let is_mine = crate::message::from_me(&content, names.my_aci());
-        let Some((_, dm)) = crate::message::data_message(&content) else {
-            break;
-        };
-        if is_mine {
-            // an AI answer (placeholder root): its quote.id points at the
-            // trigger it answered — keep walking back
-            match dm.quote.as_ref().and_then(|q| q.id) {
-                Some(qts) => {
-                    ts = qts;
-                    continue;
-                }
-                None => break,
-            }
-        } else {
-            // a user trigger: collect its own images
-            let own = dm_images(dm);
-            if !own.is_empty() {
-                imgs.extend(fetch_images(manager, &own).await);
-            }
-            // also resolve images the trigger itself was replying to (its quote)
-            if let Some(qts) = dm.quote.as_ref().and_then(|q| q.id) {
-                let from_store = match manager.store().message(thread, qts).await {
-                    Ok(Some(orig)) => content_images(&orig),
-                    _ => Vec::new(),
-                };
-                let fetched = fetch_images(manager, &from_store).await;
-                let fetched = if fetched.is_empty() {
-                    let thumbs = dm
-                        .quote
-                        .as_ref()
-                        .map(|q| {
-                            q.attachments
-                                .iter()
-                                .filter_map(|a| a.thumbnail.clone())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    fetch_images(manager, &thumbs).await
-                } else {
-                    fetched
-                };
-                imgs.extend(fetched);
-                ts = qts;
-                continue;
-            }
-            break;
-        }
-    }
-    imgs
+    cfg: &Config,
+    sender: &str,
+    trigger: &Trigger,
+    reply_to_ai: bool,
+    history: &[HistMsg],
+) -> (Vec<serde_json::Value>, usize) {
+    let mut convo = history_turns(manager, cfg, history).await;
+    let (turn, images) =
+        trigger_turn(manager, names, cfg, sender, trigger, reply_to_ai, history).await;
+    convo.push(turn);
+    (convo, images)
 }
 
 // the originating trigger's identity, passed to handle_trigger so it can quote
@@ -256,6 +196,8 @@ struct TriggerRef {
 // separate rows keyed by their own timestamp, so the caller records the answer
 // under all of them: that way any row of the chain is recognised as ours rather
 // than leaking back into context as an owner message.
+// returns (answer root ts, answer tip ts, answer text, the convo it was given),
+// so the caller can cache the finished conversation for continuation.
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
@@ -263,7 +205,7 @@ async fn handle_trigger<S: Store>(
     trigger: &TriggerRef,
     convo: Vec<serde_json::Value>,
     chat_context: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(u64, u64, String, Vec<serde_json::Value>)> {
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
     let placeholder_ts = now_ts().max(trigger.ts + 1);
@@ -287,7 +229,7 @@ async fn handle_trigger<S: Store>(
 
     let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
-    let stream = cfg.ai.complete(convo, chat_context, move |p| {
+    let stream = cfg.ai.complete(&convo, chat_context, move |p| {
         let _ = tx.unbounded_send(p);
     });
     let edits = async {
@@ -335,17 +277,27 @@ async fn handle_trigger<S: Store>(
     };
 
     let edit_ts = now_ts().max(last_ts + 1);
-    if let Err(e) = send_edit(manager, &recipient, last_ts, answer, edit_ts, Some(quote)).await {
+    if let Err(e) = send_edit(
+        manager,
+        &recipient,
+        last_ts,
+        answer.clone(),
+        edit_ts,
+        Some(quote),
+    )
+    .await
+    {
         error!(%e, "edit failed");
     }
 
-    Ok(())
+    Ok((placeholder_ts, edit_ts, answer, convo))
 }
 
 async fn process_content<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     names: &Names,
+    cache: &mut ConvoCache,
     content: &presage::libsignal_service::content::Content,
 ) {
     let Some(mut t) = extract(content) else {
@@ -376,29 +328,61 @@ async fn process_content<S: Store>(
 
     let trigger_ts = content.timestamp();
     let trigger_sender_aci = *content.metadata.sender.raw_uuid().as_bytes();
-    let history = thread_history(
-        manager,
-        &t.thread,
-        trigger_ts,
-        cfg.context_messages,
-        &cfg.processing_msg,
-        &[&cfg.processing_msg, &cfg.reasoning_msg, &cfg.generating_msg],
-        names,
-    )
-    .await;
 
-    let (convo, images) =
-        build_convo(manager, names, cfg, &sender, &t, reply_to_ai, &history).await;
-    let chat_context = names.chat_context(manager, &t.thread).await;
+    // if this reply continues one of our answers, which answer's root does it
+    // resolve to? that's the cache key.
+    let parent_root = match (reply_to_ai, t.quoted_ts) {
+        (true, Some(qts)) => ai_root_ts(manager, names, &t.thread, qts, &cfg.processing_msg).await,
+        _ => None,
+    };
+    // clone eagerly so the cache borrow ends before we build the new turn
+    let hit = parent_root
+        .and_then(|r| cache.get(r))
+        .map(|c| (c.convo.clone(), c.chat_context.clone(), c.tip_ts));
+
+    let (convo, images, chat_context, context) = match hit {
+        Some((cached_convo, cached_context, tip_ts)) => {
+            // reuse the cached array (its images included), append whatever was
+            // written since (with their images), then this turn. the reused
+            // prefix stays byte-identical so llama-server keeps its prompt cache.
+            let between =
+                thread_history(manager, &t.thread, tip_ts, trigger_ts, None, cfg, names).await;
+            let mut convo = cached_convo;
+            convo.extend(history_turns(manager, cfg, &between).await);
+            let (turn, images) =
+                trigger_turn(manager, names, cfg, &sender, &t, reply_to_ai, &between).await;
+            convo.push(turn);
+            (convo, images, cached_context, between.len())
+        }
+        None => {
+            // fresh @ai, or a miss (restart / evicted / older answer): build from
+            // the last-N window
+            let history = thread_history(
+                manager,
+                &t.thread,
+                0,
+                trigger_ts,
+                Some(cfg.context_messages),
+                cfg,
+                names,
+            )
+            .await;
+            let (convo, images) =
+                build_convo(manager, names, cfg, &sender, &t, reply_to_ai, &history).await;
+            let chat_context = names.chat_context(manager, &t.thread).await;
+            (convo, images, chat_context, history.len())
+        }
+    };
 
     info!(
         thread = ?t.thread,
         replying = is_reply,
+        continued = parent_root.is_some(),
         images,
-        context = history.len(),
+        context,
         "handling @ai prompt"
     );
-    if let Err(e) = handle_trigger(
+    match handle_trigger(
         manager,
         cfg,
         recipient,
@@ -412,7 +396,26 @@ async fn process_content<S: Store>(
     )
     .await
     {
-        error!(%e, "failed to handle prompt");
+        Ok((root_ts, tip_ts, answer, mut convo)) => {
+            // don't cache error/empty sentinels, so a retry rebuilds cleanly
+            let is_error = answer == "(empty response)" || answer.starts_with("ai error:");
+            if !is_error {
+                convo.push(serde_json::json!({ "role": "assistant", "content": answer }));
+                cache.insert(
+                    root_ts,
+                    Cached {
+                        convo,
+                        chat_context,
+                        tip_ts,
+                    },
+                );
+                // the answer we continued from is now superseded by this child
+                if let Some(p) = parent_root {
+                    cache.remove(p);
+                }
+            }
+        }
+        Err(e) => error!(%e, "failed to handle prompt"),
     }
 }
 
@@ -438,6 +441,9 @@ pub async fn run_loop<S: Store>(
     // don't answer the backlog that gets replayed on startup. only act on
     // messages that arrive after the initial sync drains (first QueueEmpty).
     let mut live = false;
+    // finished conversations kept warm so a reply to one continues its exact
+    // messages array instead of rebuilding from the store
+    let mut cache = ConvoCache::new(CONVO_CACHE_CAP);
 
     info!("running. send `{}  <prompt>` in any chat", cfg.trigger);
 
@@ -449,7 +455,7 @@ pub async fn run_loop<S: Store>(
                 if !live {
                     continue;
                 }
-                process_content(&mut manager, cfg, &names, &content).await;
+                process_content(&mut manager, cfg, &names, &mut cache, &content).await;
             }
         }
     }

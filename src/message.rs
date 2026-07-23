@@ -314,6 +314,7 @@ pub struct Version {
     pub speaker: String,
     pub reply_to: Option<ReplyRef>,
     pub body: String,
+    pub images: Vec<AttachmentPointer>,
 }
 
 // extract a text version (original or edit) from a stored message. `thinking` is
@@ -350,5 +351,6 @@ pub async fn message_version<S: Store>(
         speaker,
         reply_to,
         body,
+        images: dm_images(dm),
     })
 }

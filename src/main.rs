@@ -1,5 +1,6 @@
 mod ai;
 mod config;
+mod convo_cache;
 mod handler;
 mod history;
 mod images;
