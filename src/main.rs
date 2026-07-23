@@ -78,13 +78,9 @@ async fn link(
         Ok(m) => m,
         Err(e) if is_link_conflict(&e) => {
             return Err(e).context(
-                "Signal rejected the link request with a 409 conflict. This most often means the \
-                 bot is out of date and no longer advertises a device capability the account now \
-                 requires of new linked devices, so the server refuses the link. Waiting will not \
-                 help; update the bot to a build with current presage and libsignal-service \
-                 dependencies and try again. A 409 can also appear briefly right after unlinking \
-                 while the account's device list settles, so if you just unlinked, wait a few \
-                 minutes and restart before assuming an update is needed.",
+                "link rejected with a 409: this build is missing a device capability the account \
+                 requires. update the bot and relink. (if you just unlinked, retry in a few \
+                 minutes first.)",
             );
         }
         Err(e) => return Err(e.into()),
