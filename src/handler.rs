@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
@@ -20,12 +20,15 @@ use crate::message::{
     Trigger,
 };
 use crate::names::Names;
+use crate::prune::prune_old_messages;
 use crate::recipient::{send_edit, send_to, Recipient};
 
 // how many finished conversations to keep warm for continuation
 const CONVO_CACHE_CAP: usize = 64;
+// how often to sweep the store for messages past the retention window
+const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-fn now_ts() -> u64 {
+pub(crate) fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards")
@@ -424,7 +427,7 @@ pub enum Outcome {
     Relink,
 }
 
-pub async fn run_loop<S: Store>(
+pub async fn run_loop<S: Store + Clone>(
     mut manager: Manager<S, Registered>,
     cfg: &Config,
 ) -> anyhow::Result<Outcome> {
@@ -447,15 +450,28 @@ pub async fn run_loop<S: Store>(
 
     info!("running. send `{}  <prompt>` in any chat", cfg.trigger);
 
-    while let Some(received) = messages.next().await {
-        match received {
-            Received::QueueEmpty => live = true,
-            Received::Contacts => {}
-            Received::Content(content) => {
-                if !live {
-                    continue;
+    let mut prune_tick = tokio::time::interval(PRUNE_INTERVAL);
+
+    loop {
+        tokio::select! {
+            received = messages.next() => {
+                let Some(received) = received else { break };
+                match received {
+                    Received::QueueEmpty => live = true,
+                    Received::Contacts => {}
+                    Received::Content(content) => {
+                        if !live {
+                            continue;
+                        }
+                        process_content(&mut manager, cfg, &names, &mut cache, &content).await;
+                    }
                 }
-                process_content(&mut manager, cfg, &names, &mut cache, &content).await;
+            }
+            // don't prune before the initial sync drains
+            _ = prune_tick.tick(), if live => {
+                if let Some(retention) = cfg.retention {
+                    prune_old_messages(&manager, retention).await;
+                }
             }
         }
     }
