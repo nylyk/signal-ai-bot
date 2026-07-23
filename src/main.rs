@@ -9,10 +9,12 @@ mod names;
 mod prune;
 mod recipient;
 
+use anyhow::Context as _;
 use futures::{channel::oneshot, future};
 use tracing::{error, info, warn};
 
 use presage::libsignal_service::configuration::SignalServers;
+use presage::libsignal_service::prelude::ServiceError;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::store::StateStore;
@@ -26,6 +28,18 @@ async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     // left unencrypted: a passphrase passed via env would sit right next to the
     // data it protects, so securing the volume is left to the host
     Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
+}
+
+// signal returns a 409 on linking for a stale device list (e.g. just after an
+// unlink) or a missing capability; explain it rather than surface a bare code.
+fn is_link_conflict<E: std::error::Error>(e: &presage::Error<E>) -> bool {
+    matches!(
+        e,
+        presage::Error::ServiceError(
+            ServiceError::MismatchedDevicesException(_)
+                | ServiceError::UnhandledResponseCode { http_code: 409 }
+        )
+    )
 }
 
 async fn link(
@@ -49,7 +63,19 @@ async fn link(
     )
     .await;
 
-    let manager = manager?;
+    let manager = match manager {
+        Ok(m) => m,
+        Err(e) if is_link_conflict(&e) => {
+            return Err(e).context(
+                "Signal rejected the link request with a 409 conflict. This typically means the \
+                 account's device list is briefly inconsistent, most often just after a device \
+                 was unlinked, which clears on its own; wait a few minutes and restart the bot \
+                 to retry. It can also mean this client is missing a device capability the \
+                 account requires, which instead calls for updating to a current build.",
+            );
+        }
+        Err(e) => return Err(e.into()),
+    };
     let whoami = manager.whoami().await?;
     info!("linked. account: {whoami:?}");
     Ok(manager)
