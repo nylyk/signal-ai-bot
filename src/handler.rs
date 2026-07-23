@@ -164,8 +164,7 @@ async fn trigger_turn<S: Store>(
         }
     }
 
-    let image_count = imgs.len();
-    (user_turn_value(q, &imgs), image_count)
+    (user_turn_value(q, &imgs), imgs.len())
 }
 
 // a fresh conversation: the last-N window turned into turns, then the trigger

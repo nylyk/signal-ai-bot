@@ -9,14 +9,6 @@ use crate::config::Config;
 use crate::message::{message_version, ReplyRef};
 use crate::names::Names;
 
-struct Entry {
-    is_ai: bool,
-    speaker: String,
-    reply_to: Option<ReplyRef>,
-    body: String,
-    images: Vec<AttachmentPointer>,
-}
-
 pub struct HistMsg {
     pub is_ai: bool,
     pub speaker: String,
@@ -74,7 +66,7 @@ pub async fn thread_history<S: Store>(
     // apply oldest revision first so the newest edit wins
     versions.sort_by_key(|v| v.own_ts);
 
-    let mut entries: HashMap<u64, Entry> = HashMap::new();
+    let mut entries: HashMap<u64, HistMsg> = HashMap::new();
     let mut root_of: HashMap<u64, u64> = HashMap::new();
 
     for v in versions {
@@ -86,49 +78,35 @@ pub async fn thread_history<S: Store>(
         match entries.get_mut(&root) {
             // edit of a message we already have: keep the sender/reply/images
             // (from the original), swap text
-            Some(e) => e.body = v.body,
+            Some(e) => e.text = v.body,
             None => {
                 entries.insert(
                     root,
-                    Entry {
+                    HistMsg {
                         is_ai: v.is_ai,
                         speaker: v.speaker,
                         reply_to: v.reply_to,
-                        body: v.body,
+                        text: v.body,
                         images: v.images,
+                        ts: root,
                     },
                 );
             }
         }
     }
 
-    let mut out: Vec<(u64, HistMsg)> = entries
-        .into_iter()
-        .map(|(root, e)| {
-            (
-                root,
-                HistMsg {
-                    is_ai: e.is_ai,
-                    speaker: e.speaker,
-                    reply_to: e.reply_to,
-                    text: e.body,
-                    images: e.images,
-                    ts: root,
-                },
-            )
-        })
-        .collect();
+    let mut out: Vec<HistMsg> = entries.into_values().collect();
     // drop our own transient status lines: a reply whose final answer edit isn't
     // in this window yet (e.g. a concurrent trigger) would otherwise collapse to
     // a bare "thinking..."/"writing..." and surface as the bot's words
-    out.retain(|(_, m)| !(m.is_ai && status_msgs.contains(&m.text.as_str())));
-    out.sort_by_key(|(root, _)| *root);
+    out.retain(|m| !(m.is_ai && status_msgs.contains(&m.text.as_str())));
+    out.sort_by_key(|m| m.ts);
     // a reply's chain collapses to one entry above; if it ever fails to,
     // adjacent entries carry the same answer text, so fold them back together
-    out.dedup_by(|(_, b), (_, a)| a.is_ai && b.is_ai && a.text == b.text);
+    out.dedup_by(|b, a| a.is_ai && b.is_ai && a.text == b.text);
     let start = match limit {
         Some(n) => out.len().saturating_sub(n),
         None => 0,
     };
-    out.split_off(start).into_iter().map(|(_, m)| m).collect()
+    out.split_off(start)
 }

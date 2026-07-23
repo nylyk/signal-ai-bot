@@ -35,12 +35,12 @@ impl Config {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(5);
-        // days of history to keep; 0 disables pruning. default 7.
-        let retention = std::env::var("MESSAGE_RETENTION_DAYS")
+        let retention_days = std::env::var("MESSAGE_RETENTION_DAYS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(7);
-        let retention = (retention != 0).then(|| retention * 24 * 60 * 60 * 1000);
+        // 0 keeps history forever; otherwise convert days to milliseconds
+        let retention = (retention_days != 0).then(|| retention_days * 24 * 60 * 60 * 1000);
         let reasoning_budget = std::env::var("REASONING_BUDGET")
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
