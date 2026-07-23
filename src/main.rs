@@ -68,8 +68,8 @@ async fn link(
         Err(e) if is_link_conflict(&e) => {
             return Err(e).context(
                 "Signal rejected the link request with a 409 conflict. This typically means the \
-                 account's device list is briefly inconsistent — most often just after a device \
-                 was unlinked — which clears on its own; wait a few minutes and restart the bot \
+                 account's device list is briefly inconsistent, most often just after a device \
+                 was unlinked, which clears on its own; wait a few minutes and restart the bot \
                  to retry. It can also mean this client is missing a device capability the \
                  account requires, which instead calls for updating to a current build.",
             );
