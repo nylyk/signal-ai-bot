@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 
 use presage::libsignal_service::configuration::SignalServers;
 use presage::libsignal_service::prelude::ServiceError;
+use presage::libsignal_service::provisioning::ProvisioningError;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::store::StateStore;
@@ -30,16 +31,26 @@ async fn open_store(db_path: &str) -> anyhow::Result<SqliteStore> {
     Ok(SqliteStore::open_with_passphrase(db_path, None, OnNewIdentity::Trust).await?)
 }
 
-// signal returns a 409 on linking for a stale device list (e.g. just after an
-// unlink) or a missing capability; explain it rather than surface a bare code.
+fn is_conflict_service_error(e: &ServiceError) -> bool {
+    match e {
+        ServiceError::MismatchedDevicesException(_) => true,
+        ServiceError::UnhandledResponseCode { status, .. } => status.as_u16() == 409,
+        _ => false,
+    }
+}
+
+// signal returns a 409 on linking when this client omits a device capability
+// the account requires, or (transiently) while the device list settles after an
+// unlink; explain it rather than surface a bare code. during linking the 409
+// arrives wrapped in a ProvisioningError, so check both nestings.
 fn is_link_conflict<E: std::error::Error>(e: &presage::Error<E>) -> bool {
-    matches!(
-        e,
-        presage::Error::ServiceError(
-            ServiceError::MismatchedDevicesException(_)
-                | ServiceError::UnhandledResponseCode { http_code: 409 }
-        )
-    )
+    match e {
+        presage::Error::ServiceError(se) => is_conflict_service_error(se),
+        presage::Error::ProvisioningError(ProvisioningError::ServiceError(se)) => {
+            is_conflict_service_error(se)
+        }
+        _ => false,
+    }
 }
 
 async fn link(
@@ -67,11 +78,13 @@ async fn link(
         Ok(m) => m,
         Err(e) if is_link_conflict(&e) => {
             return Err(e).context(
-                "Signal rejected the link request with a 409 conflict. This typically means the \
-                 account's device list is briefly inconsistent, most often just after a device \
-                 was unlinked, which clears on its own; wait a few minutes and restart the bot \
-                 to retry. It can also mean this client is missing a device capability the \
-                 account requires, which instead calls for updating to a current build.",
+                "Signal rejected the link request with a 409 conflict. This most often means the \
+                 bot is out of date and no longer advertises a device capability the account now \
+                 requires of new linked devices, so the server refuses the link. Waiting will not \
+                 help; update the bot to a build with current presage and libsignal-service \
+                 dependencies and try again. A 409 can also appear briefly right after unlinking \
+                 while the account's device list settles, so if you just unlinked, wait a few \
+                 minutes and restart before assuming an update is needed.",
             );
         }
         Err(e) => return Err(e.into()),

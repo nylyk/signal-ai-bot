@@ -50,7 +50,7 @@ pub async fn prune_old_messages<S: Store + Clone>(
         // the iterator into a vec before deleting to end its borrow of the store.
         let stale: Vec<u64> = iter
             .filter_map(Result::ok)
-            .map(|c| c.metadata.timestamp)
+            .map(|c| c.metadata.timestamp.timestamp_millis() as u64)
             .filter(|ts| *ts < cutoff)
             .collect();
         for ts in stale {

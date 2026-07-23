@@ -334,7 +334,7 @@ pub async fn message_version<S: Store>(
     // content.timestamp() returns the *target* for edits; we need this revision's
     // own id (its envelope ts) so edit chains link by target instead of orphaning
     let own_ts = if target.is_some() {
-        content.metadata.timestamp
+        content.metadata.timestamp.timestamp_millis() as u64
     } else {
         content.timestamp()
     };
