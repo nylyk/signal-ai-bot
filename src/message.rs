@@ -152,18 +152,12 @@ pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
     }
 }
 
-// pull text, reply info, and images out of a message (sent or received)
+// pull text, reply info, and images out of an original message (sent or
+// received); edits don't re-trigger the bot, so they yield None
 pub fn extract(content: &Content) -> Option<Trigger> {
     let thread = Thread::try_from(content).ok()?;
-    let dm = match &content.body {
-        ContentBody::DataMessage(dm) => dm,
-        ContentBody::SynchronizeMessage(SyncMessage {
-            sent: Some(Sent {
-                message: Some(dm), ..
-            }),
-            ..
-        }) => dm,
-        _ => return None,
+    let (None, dm) = data_message(content)? else {
+        return None;
     };
     let body = dm.body.clone()?;
     let quote = dm.quote.as_ref();
@@ -293,7 +287,7 @@ pub async fn ai_root_ts<S: Store>(
     None
 }
 
-// retained for callers that only need the boolean answer
+// the boolean form of `ai_root_ts`, for callers that only need yes/no
 pub async fn is_ai_message<S: Store>(
     manager: &Manager<S, Registered>,
     names: &Names,
