@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
 use presage::libsignal_service::content::DataMessage;
 use presage::libsignal_service::proto::data_message::Quote;
+use presage::libsignal_service::proto::AttachmentPointer;
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, Store};
@@ -11,13 +12,14 @@ use presage::Manager;
 use tracing::{error, info};
 
 use crate::ai::Phase;
+use crate::audio::fetch_audio;
 use crate::config::Config;
 use crate::convo_cache::{Cached, ConvoCache};
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
 use crate::message::{
-    ai_root_ts, content_images, extract, is_ai_message, resolve_author, resolve_mentions, ReplyRef,
-    Trigger,
+    ai_root_ts, content_audio, content_images, extract, is_ai_message, resolve_author,
+    resolve_mentions, ReplyRef, Trigger,
 };
 use crate::names::Names;
 use crate::prune::prune_old_messages;
@@ -56,25 +58,69 @@ fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> S
     s
 }
 
-// a `user` turn: plain string content when there are no images, else a
-// multimodal parts array with the text followed by each image as an image_url.
-fn user_turn_value(text: String, imgs: &[(String, String)]) -> serde_json::Value {
-    if imgs.is_empty() {
+// a `user` turn: plain string content when there's no media, else a multimodal
+// parts array with the text, then each image as an image_url, then each audio
+// clip. audio goes last because gemma 4 asks for it after the text, and it
+// carries raw base64 rather than a data uri — llama.cpp only unwraps `data:`
+// uris for images.
+fn user_turn_value(text: String, media: &Media) -> serde_json::Value {
+    if media.is_empty() {
         return serde_json::json!({ "role": "user", "content": text });
     }
     let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
-    for (mime, data) in imgs {
+    for (mime, data) in &media.images {
         parts.push(serde_json::json!({
             "type": "image_url",
             "image_url": { "url": format!("data:{mime};base64,{data}") }
         }));
     }
+    for data in &media.audio {
+        parts.push(serde_json::json!({
+            "type": "input_audio",
+            "input_audio": { "data": data, "format": "wav" }
+        }));
+    }
     serde_json::json!({ "role": "user", "content": parts })
+}
+
+// the encoded attachments of one turn: images as (mime, base64), audio as
+// base64 wav clips of at most 30s each
+#[derive(Default)]
+struct Media {
+    images: Vec<(String, String)>,
+    audio: Vec<String>,
+}
+
+impl Media {
+    fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.audio.is_empty()
+    }
+}
+
+// download whichever of a message's attachments the enabled modalities cover
+async fn fetch_media<S: Store>(
+    manager: &mut Manager<S, Registered>,
+    cfg: &Config,
+    images: &[AttachmentPointer],
+    audio: &[AttachmentPointer],
+) -> Media {
+    Media {
+        images: if cfg.vision {
+            fetch_images(manager, images).await
+        } else {
+            Vec::new()
+        },
+        audio: if cfg.audio {
+            fetch_audio(manager, audio, cfg.audio_speed).await
+        } else {
+            Vec::new()
+        },
+    }
 }
 
 // turn a window of history into chat messages. the bot's own answers become
 // `assistant` turns; everyone else's become `user` turns carrying that message's
-// own images (fetched only when vision is on).
+// own attachments (fetched only for the modalities that are on).
 async fn history_turns<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
@@ -86,22 +132,18 @@ async fn history_turns<S: Store>(
             turns.push(serde_json::json!({ "role": "assistant", "content": h.text.clone() }));
             continue;
         }
-        let imgs = if cfg.vision {
-            fetch_images(manager, &h.images).await
-        } else {
-            Vec::new()
-        };
+        let media = fetch_media(manager, cfg, &h.images, &h.audio).await;
         let text = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
-        turns.push(user_turn_value(text, &imgs));
+        turns.push(user_turn_value(text, &media));
     }
     turns
 }
 
 // the final `user` turn for the triggering message: its text plus its own
-// images. `window` is the set of turns already in the array; a directly-quoted
-// image is added only when the quoted message isn't already one of them (so an
-// in-window image isn't sent twice), covering replies to a photo from before the
-// window.
+// attachments. `window` is the set of turns already in the array; directly-quoted
+// media is added only when the quoted message isn't already one of them (so an
+// in-window attachment isn't sent twice), covering replies to a photo or voice
+// note from before the window.
 async fn trigger_turn<S: Store>(
     manager: &mut Manager<S, Registered>,
     names: &Names,
@@ -110,7 +152,7 @@ async fn trigger_turn<S: Store>(
     trigger: &Trigger,
     reply_to_ai: bool,
     window: &[HistMsg],
-) -> (serde_json::Value, usize) {
+) -> (serde_json::Value, Media) {
     let reply_to = if trigger.is_reply() {
         let author = resolve_author(
             manager,
@@ -132,39 +174,48 @@ async fn trigger_turn<S: Store>(
     // context rather than looking stripped
     let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
 
-    let mut imgs = Vec::new();
-    if cfg.vision {
-        imgs.extend(fetch_images(manager, &trigger.own_images).await);
+    let mut media = fetch_media(manager, cfg, &trigger.own_images, &trigger.own_audio).await;
 
-        // a directly-quoted image the model can't already see in this window:
-        // prefer the full-resolution original from the local store, fall back to
-        // the quote's embedded thumbnail when that yields nothing
-        if let Some(qts) = trigger.quoted_ts {
-            if !window.iter().any(|h| h.ts == qts) {
-                let from_store = match manager.store().message(&trigger.thread, qts).await {
-                    Ok(Some(orig)) => content_images(&orig),
-                    _ => Vec::new(),
-                };
-                let mut reply_imgs = fetch_images(manager, &from_store).await;
-                let used_thumb = reply_imgs.is_empty();
-                if reply_imgs.is_empty() {
-                    reply_imgs = fetch_images(manager, &trigger.quoted_thumbnails).await;
-                }
-                info!(
-                    store_ptrs = from_store.len(),
-                    thumb_ptrs = trigger.quoted_thumbnails.len(),
-                    fetched = reply_imgs.len(),
-                    used_thumb,
-                    "resolved reply image"
-                );
-                imgs.extend(reply_imgs);
+    // directly-quoted media the model can't already see in this window: prefer
+    // the full original from the local store, falling back to the quote's
+    // embedded thumbnail when that yields nothing. a quote only ever embeds
+    // still-image thumbnails, so audio has no such fallback.
+    match trigger.quoted_ts {
+        Some(qts) if !window.iter().any(|h| h.ts == qts) => {
+            let orig = manager
+                .store()
+                .message(&trigger.thread, qts)
+                .await
+                .ok()
+                .flatten();
+            let img_ptrs = orig.as_ref().map(content_images).unwrap_or_default();
+            let aud_ptrs = orig.as_ref().map(content_audio).unwrap_or_default();
+            let mut quoted = fetch_media(manager, cfg, &img_ptrs, &aud_ptrs).await;
+            let used_thumb = cfg.vision && quoted.images.is_empty();
+            if used_thumb {
+                quoted.images = fetch_images(manager, &trigger.quoted_thumbnails).await;
             }
-        } else if !trigger.quoted_thumbnails.is_empty() {
-            imgs.extend(fetch_images(manager, &trigger.quoted_thumbnails).await);
+            info!(
+                store_images = img_ptrs.len(),
+                store_audio = aud_ptrs.len(),
+                thumb_ptrs = trigger.quoted_thumbnails.len(),
+                images = quoted.images.len(),
+                audio = quoted.audio.len(),
+                used_thumb,
+                "resolved reply media"
+            );
+            media.images.extend(quoted.images);
+            media.audio.extend(quoted.audio);
         }
+        None if cfg.vision && !trigger.quoted_thumbnails.is_empty() => {
+            media
+                .images
+                .extend(fetch_images(manager, &trigger.quoted_thumbnails).await);
+        }
+        _ => {}
     }
 
-    (user_turn_value(q, &imgs), imgs.len())
+    (user_turn_value(q, &media), media)
 }
 
 // a fresh conversation: the last-N window turned into turns, then the trigger
@@ -176,12 +227,12 @@ async fn build_convo<S: Store>(
     trigger: &Trigger,
     reply_to_ai: bool,
     history: &[HistMsg],
-) -> (Vec<serde_json::Value>, usize) {
+) -> (Vec<serde_json::Value>, Media) {
     let mut convo = history_turns(manager, cfg, history).await;
-    let (turn, images) =
+    let (turn, media) =
         trigger_turn(manager, names, cfg, sender, trigger, reply_to_ai, history).await;
     convo.push(turn);
-    (convo, images)
+    (convo, media)
 }
 
 // the originating trigger's identity, passed to handle_trigger so it can quote
@@ -318,10 +369,10 @@ async fn process_content<S: Store>(
         return;
     }
     let is_reply = t.is_reply();
-    // allow an image-only or reply-only prompt (e.g. a photo or a reply
+    // allow a media-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
     let only_trigger = trimmed.is_empty() || trimmed == cfg.trigger;
-    if only_trigger && t.own_images.is_empty() && !is_reply {
+    if only_trigger && t.own_images.is_empty() && t.own_audio.is_empty() && !is_reply {
         return;
     }
     let recipient = Recipient::from_thread(&t.thread);
@@ -342,19 +393,19 @@ async fn process_content<S: Store>(
         .and_then(|r| cache.get(r))
         .map(|c| (c.convo.clone(), c.chat_context.clone(), c.tip_ts));
 
-    let (convo, images, chat_context, context) = match hit {
+    let (convo, media, chat_context, context) = match hit {
         Some((cached_convo, cached_context, tip_ts)) => {
-            // reuse the cached array (its images included), append whatever was
-            // written since (with their images), then this turn. the reused
-            // prefix stays byte-identical so llama-server keeps its prompt cache.
+            // reuse the cached array (its media included), append whatever was
+            // written since (with theirs), then this turn. the reused prefix
+            // stays byte-identical so llama-server keeps its prompt cache.
             let between =
                 thread_history(manager, &t.thread, tip_ts, trigger_ts, None, cfg, names).await;
             let mut convo = cached_convo;
             convo.extend(history_turns(manager, cfg, &between).await);
-            let (turn, images) =
+            let (turn, media) =
                 trigger_turn(manager, names, cfg, &sender, &t, reply_to_ai, &between).await;
             convo.push(turn);
-            (convo, images, cached_context, between.len())
+            (convo, media, cached_context, between.len())
         }
         None => {
             // fresh @ai, or a miss (restart / evicted / older answer): build from
@@ -369,10 +420,10 @@ async fn process_content<S: Store>(
                 names,
             )
             .await;
-            let (convo, images) =
+            let (convo, media) =
                 build_convo(manager, names, cfg, &sender, &t, reply_to_ai, &history).await;
             let chat_context = names.chat_context(manager, &t.thread).await;
-            (convo, images, chat_context, history.len())
+            (convo, media, chat_context, history.len())
         }
     };
 
@@ -380,7 +431,8 @@ async fn process_content<S: Store>(
         thread = ?t.thread,
         replying = is_reply,
         continued = parent_root.is_some(),
-        images,
+        images = media.images.len(),
+        audio = media.audio.len(),
         context,
         "handling @ai prompt"
     );
@@ -463,6 +515,9 @@ pub async fn run_loop<S: Store + Clone>(
                             continue;
                         }
                         process_content(&mut manager, cfg, &names, &mut cache, &content).await;
+                    }
+                    Received::DecryptionError(sender) => {
+                        info!("dropping undecryptable message from {sender:?}");
                     }
                 }
             }

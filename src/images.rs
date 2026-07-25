@@ -3,7 +3,9 @@ use presage::libsignal_service::proto::AttachmentPointer;
 use presage::manager::Registered;
 use presage::store::Store;
 use presage::Manager;
-use tracing::{error, warn};
+use tracing::warn;
+
+use crate::media::fetch_raw;
 
 // llama.cpp's image loader (stb_image) handles jpeg/png/gif/bmp but not webp,
 // so transcode anything that isn't already jpeg/png (webp stickers, etc.) to png
@@ -25,20 +27,8 @@ pub async fn fetch_images<S: Store>(
     ptrs: &[AttachmentPointer],
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for p in ptrs {
-        let data = match manager.get_attachment(p).await {
-            Ok(d) => d,
-            Err(e) => {
-                error!(%e, "failed to fetch image attachment");
-                continue;
-            }
-        };
-        if data.is_empty() {
-            warn!("empty image attachment, skipping");
-            continue;
-        }
-        let mime = p.content_type.as_deref().unwrap_or("");
-        match to_loadable(mime, data) {
+    for (mime, data) in fetch_raw(manager, ptrs, "image").await {
+        match to_loadable(&mime, data) {
             Some((mime, bytes)) => out.push((mime, BASE64_STANDARD.encode(&bytes))),
             None => warn!(mime, "could not decode image attachment, skipping"),
         }

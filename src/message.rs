@@ -106,6 +106,7 @@ pub struct Trigger {
     pub quoted_author: Option<Uuid>,
     pub quoted_thumbnails: Vec<AttachmentPointer>,
     pub own_images: Vec<AttachmentPointer>,
+    pub own_audio: Vec<AttachmentPointer>,
     pub body_ranges: Vec<BodyRange>,
 }
 
@@ -118,12 +119,12 @@ impl Trigger {
     }
 }
 
-fn image_pointers(atts: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
+fn media_pointers(atts: &[AttachmentPointer], prefix: &str) -> Vec<AttachmentPointer> {
     atts.iter()
         .filter(|a| {
             a.content_type
                 .as_deref()
-                .is_some_and(|t| t.starts_with("image/"))
+                .is_some_and(|t| t.starts_with(prefix))
         })
         .cloned()
         .collect()
@@ -132,24 +133,38 @@ fn image_pointers(atts: &[AttachmentPointer]) -> Vec<AttachmentPointer> {
 // image attachments of a message: regular image attachments plus a sticker's
 // image (stickers live in their own field, not in `attachments`)
 pub(crate) fn dm_images(dm: &DataMessage) -> Vec<AttachmentPointer> {
-    let mut ptrs = image_pointers(&dm.attachments);
+    let mut ptrs = media_pointers(&dm.attachments, "image/");
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {
         ptrs.push(data);
     }
     ptrs
 }
 
-pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
+// audio attachments of a message: voice notes and any other audio file
+pub(crate) fn dm_audio(dm: &DataMessage) -> Vec<AttachmentPointer> {
+    media_pointers(&dm.attachments, "audio/")
+}
+
+// the data message an original (non-edit) envelope carries, sent or received
+fn original_dm(content: &Content) -> Option<&DataMessage> {
     match &content.body {
-        ContentBody::DataMessage(dm) => dm_images(dm),
+        ContentBody::DataMessage(dm) => Some(dm),
         ContentBody::SynchronizeMessage(SyncMessage {
             sent: Some(Sent {
                 message: Some(dm), ..
             }),
             ..
-        }) => dm_images(dm),
-        _ => Vec::new(),
+        }) => Some(dm),
+        _ => None,
     }
+}
+
+pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
+    original_dm(content).map(dm_images).unwrap_or_default()
+}
+
+pub fn content_audio(content: &Content) -> Vec<AttachmentPointer> {
+    original_dm(content).map(dm_audio).unwrap_or_default()
 }
 
 // pull text, reply info, and images out of an original message (sent or
@@ -175,7 +190,6 @@ pub fn extract(content: &Content) -> Option<Trigger> {
                 .collect()
         })
         .unwrap_or_default();
-    let own_images = dm_images(dm);
     Some(Trigger {
         thread,
         body,
@@ -183,7 +197,8 @@ pub fn extract(content: &Content) -> Option<Trigger> {
         quoted_ts,
         quoted_author,
         quoted_thumbnails: quoted_thumbs,
-        own_images,
+        own_images: dm_images(dm),
+        own_audio: dm_audio(dm),
         body_ranges: dm.body_ranges.clone(),
     })
 }
@@ -309,6 +324,7 @@ pub struct Version {
     pub reply_to: Option<ReplyRef>,
     pub body: String,
     pub images: Vec<AttachmentPointer>,
+    pub audio: Vec<AttachmentPointer>,
 }
 
 // extract a text version (original or edit) from a stored message. `thinking` is
@@ -322,8 +338,13 @@ pub async fn message_version<S: Store>(
 ) -> Option<Version> {
     // pull the relevant data message (and any edit target) out of the envelope
     let (target, dm) = data_message(content)?;
-    let body = dm.body.clone()?;
-    if body.is_empty() {
+    let images = dm_images(dm);
+    let audio = dm_audio(dm);
+    // a media-only message (voice note, uncaptioned photo) carries no body; keep
+    // it so its attachments still reach the model, but drop anything with
+    // neither text nor media (reactions, group updates, …)
+    let body = dm.body.clone().unwrap_or_default();
+    if body.is_empty() && images.is_empty() && audio.is_empty() {
         return None;
     }
     let is_ai = from_me(content, names.my_aci()) && target.is_none() && body == thinking;
@@ -345,6 +366,7 @@ pub async fn message_version<S: Store>(
         speaker,
         reply_to,
         body,
-        images: dm_images(dm),
+        images,
+        audio,
     })
 }

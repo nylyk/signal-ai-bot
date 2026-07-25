@@ -2,6 +2,15 @@ use anyhow::Context as _;
 
 use crate::ai::AiClient;
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 pub struct Config {
     pub trigger: String,
     pub processing_msg: String,
@@ -9,6 +18,10 @@ pub struct Config {
     pub generating_msg: String,
     pub context_messages: usize,
     pub vision: bool,
+    pub audio: bool,
+    // playback rate applied to voice notes before chunking; above 1.0 fits more
+    // of a long note into the model's 30s-per-clip limit
+    pub audio_speed: f32,
     // how old a message may get before it's pruned from the store, in ms.
     // `None` keeps history forever.
     pub retention: Option<u64>,
@@ -45,15 +58,14 @@ impl Config {
             .ok()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
-        let vision = std::env::var("VISION")
+        let vision = env_flag("VISION");
+        let audio = env_flag("AUDIO");
+        // clamped to atempo's per-instance range; 1.0 leaves the note untouched
+        let audio_speed = std::env::var("AUDIO_SPEED")
             .ok()
-            .map(|s| {
-                matches!(
-                    s.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.5, 2.0);
 
         Ok(Config {
             trigger,
@@ -62,6 +74,8 @@ impl Config {
             generating_msg,
             context_messages,
             vision,
+            audio,
+            audio_speed,
             retention,
             ai: AiClient::new(base, key, model, system, reasoning_budget),
         })

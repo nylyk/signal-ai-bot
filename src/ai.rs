@@ -69,7 +69,7 @@ impl AiClient {
             body["thinking_budget_tokens"] = serde_json::json!(self.reasoning_budget);
         }
 
-        debug!(messages = %redact_images(&messages), "sending request to ai");
+        debug!(messages = %redact_media(&messages), "sending request to ai");
 
         let resp = self
             .http
@@ -125,17 +125,24 @@ impl AiClient {
     }
 }
 
-// render the messages array as compact json for logging, replacing each
-// image_url part with a short placeholder so base64 payloads don't flood logs
-fn redact_images(messages: &[serde_json::Value]) -> String {
+// render the messages array as compact json for logging, replacing each media
+// part with a short placeholder so base64 payloads don't flood logs
+fn redact_media(messages: &[serde_json::Value]) -> String {
     let mut msgs = messages.to_vec();
     for m in &mut msgs {
         let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
         for part in parts {
-            if part.get("type").and_then(|t| t.as_str()) == Some("image_url") {
-                *part = serde_json::json!({ "type": "image_url", "image_url": "<image omitted>" });
+            match part.get("type").and_then(|t| t.as_str()) {
+                Some("image_url") => {
+                    *part =
+                        serde_json::json!({ "type": "image_url", "image_url": "<image omitted>" });
+                }
+                Some("input_audio") => {
+                    *part = serde_json::json!({ "type": "input_audio", "input_audio": "<audio omitted>" });
+                }
+                _ => {}
             }
         }
     }

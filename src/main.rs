@@ -1,9 +1,11 @@
 mod ai;
+mod audio;
 mod config;
 mod convo_cache;
 mod handler;
 mod history;
 mod images;
+mod media;
 mod message;
 mod names;
 mod prune;
@@ -122,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
+    if cfg.audio && !crate::audio::have_ffmpeg().await {
+        warn!("AUDIO is on but ffmpeg is not on PATH; voice messages will be skipped");
+    }
 
     let db_path = "/data/store.db3".to_string();
     if let Some(parent) = std::path::Path::new(&db_path).parent() {

@@ -11,6 +11,9 @@ services:
       API_KEY: not-needed
       MODEL: qwen3.6
       SYSTEM_PROMPT: You're a companion in a Signal chat. Keep your answers short. You will see recent messages, prefixed with the users name. Address the last message specifically.
+      # only for models that accept them, e.g. gemma 4 E2B/E4B/12B for audio
+      VISION: "false"
+      AUDIO: "false"
       TRIGGER: "@ai"
       PROCESSING_MESSAGE: AI is processing...
       REASONING_MESSAGE: AI is thinking...

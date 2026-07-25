@@ -1,6 +1,6 @@
 [package]
 name = "signal-ai-bot"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 
@@ -28,8 +28,10 @@ serde_json = "1"
 tokio = { version = "1", features = [
   "macros",
   "rt-multi-thread",
+  "fs",
   "io-std",
   "io-util",
+  "process",
   "time",
 ] }
 tracing = "0.1"
