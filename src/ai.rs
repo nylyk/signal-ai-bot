@@ -231,9 +231,10 @@ impl AiClient {
                         on_phase(Phase::Tool);
                     }
                 }
-                if delta["reasoning_content"]
-                    .as_str()
-                    .is_some_and(|s| !s.is_empty())
+                // llama.cpp names it `reasoning_content`, openrouter `reasoning`
+                if ["reasoning_content", "reasoning"]
+                    .iter()
+                    .any(|k| delta[k].as_str().is_some_and(|s| !s.is_empty()))
                 {
                     saw_reasoning = true;
                 }
