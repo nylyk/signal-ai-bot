@@ -30,6 +30,11 @@ fn quote_author_uuid(quote: &Quote) -> Option<Uuid> {
 // body_ranges says which aci each one refers to
 const MENTION: char = '\u{FFFC}';
 
+// file name the bot gives every attachment it sends, so a message outside the
+// placeholder-edit chain can still be told apart from the owner's own. signal
+// keeps it in the pointer and shows it nowhere in the conversation.
+pub const BOT_FILE_NAME: &str = "signal-ai-bot.png";
+
 // the aci a mention range points at (uuid string or 16-byte binary form)
 fn mention_aci(range: &BodyRange) -> Option<Uuid> {
     match range.associated_value.as_ref()? {
@@ -105,8 +110,7 @@ pub struct Trigger {
     pub quoted_ts: Option<u64>,
     pub quoted_author: Option<Uuid>,
     pub quoted_thumbnails: Vec<AttachmentPointer>,
-    pub own_images: Vec<AttachmentPointer>,
-    pub own_audio: Vec<AttachmentPointer>,
+    pub own_atts: Vec<AttachmentPointer>,
     pub body_ranges: Vec<BodyRange>,
 }
 
@@ -119,30 +123,17 @@ impl Trigger {
     }
 }
 
-fn media_pointers(atts: &[AttachmentPointer], prefix: &str) -> Vec<AttachmentPointer> {
-    atts.iter()
-        .filter(|a| {
-            a.content_type
-                .as_deref()
-                .is_some_and(|t| t.starts_with(prefix))
-        })
-        .cloned()
-        .collect()
+fn sent_by_bot(atts: &[AttachmentPointer]) -> bool {
+    !atts.is_empty() && atts.iter().all(|a| a.file_name() == BOT_FILE_NAME)
 }
 
-// image attachments of a message: regular image attachments plus a sticker's
-// image (stickers live in their own field, not in `attachments`)
-pub(crate) fn dm_images(dm: &DataMessage) -> Vec<AttachmentPointer> {
-    let mut ptrs = media_pointers(&dm.attachments, "image/");
+// a sticker's image is not in `attachments`, so fold it in
+pub(crate) fn dm_attachments(dm: &DataMessage) -> Vec<AttachmentPointer> {
+    let mut ptrs = dm.attachments.clone();
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {
         ptrs.push(data);
     }
     ptrs
-}
-
-// audio attachments of a message: voice notes and any other audio file
-pub(crate) fn dm_audio(dm: &DataMessage) -> Vec<AttachmentPointer> {
-    media_pointers(&dm.attachments, "audio/")
 }
 
 // the data message an original (non-edit) envelope carries, sent or received
@@ -159,12 +150,8 @@ fn original_dm(content: &Content) -> Option<&DataMessage> {
     }
 }
 
-pub fn content_images(content: &Content) -> Vec<AttachmentPointer> {
-    original_dm(content).map(dm_images).unwrap_or_default()
-}
-
-pub fn content_audio(content: &Content) -> Vec<AttachmentPointer> {
-    original_dm(content).map(dm_audio).unwrap_or_default()
+pub fn content_attachments(content: &Content) -> Vec<AttachmentPointer> {
+    original_dm(content).map(dm_attachments).unwrap_or_default()
 }
 
 // pull text, reply info, and images out of an original message (sent or
@@ -197,8 +184,7 @@ pub fn extract(content: &Content) -> Option<Trigger> {
         quoted_ts,
         quoted_author,
         quoted_thumbnails: quoted_thumbs,
-        own_images: dm_images(dm),
-        own_audio: dm_audio(dm),
+        own_atts: dm_attachments(dm),
         body_ranges: dm.body_ranges.clone(),
     })
 }
@@ -296,7 +282,11 @@ pub async fn ai_root_ts<S: Store>(
             // an edit: follow it to the revision it targets
             Some(t) => ts = t,
             // the original: it's ours iff it's the placeholder
-            None => return (dm.body.as_deref() == Some(processing_msg)).then_some(ts),
+            None => {
+                let ours =
+                    dm.body.as_deref() == Some(processing_msg) || sent_by_bot(&dm_attachments(dm));
+                return ours.then_some(ts);
+            }
         }
     }
     None
@@ -323,8 +313,7 @@ pub struct Version {
     pub speaker: String,
     pub reply_to: Option<ReplyRef>,
     pub body: String,
-    pub images: Vec<AttachmentPointer>,
-    pub audio: Vec<AttachmentPointer>,
+    pub atts: Vec<AttachmentPointer>,
 }
 
 // extract a text version (original or edit) from a stored message. `thinking` is
@@ -338,16 +327,16 @@ pub async fn message_version<S: Store>(
 ) -> Option<Version> {
     // pull the relevant data message (and any edit target) out of the envelope
     let (target, dm) = data_message(content)?;
-    let images = dm_images(dm);
-    let audio = dm_audio(dm);
+    let atts = dm_attachments(dm);
     // a media-only message (voice note, uncaptioned photo) carries no body; keep
     // it so its attachments still reach the model, but drop anything with
-    // neither text nor media (reactions, group updates, …)
+    // neither text nor attachments (reactions, group updates, …)
     let body = dm.body.clone().unwrap_or_default();
-    if body.is_empty() && images.is_empty() && audio.is_empty() {
+    if body.is_empty() && atts.is_empty() {
         return None;
     }
-    let is_ai = from_me(content, names.my_aci()) && target.is_none() && body == thinking;
+    let ours = from_me(content, names.my_aci()) && target.is_none();
+    let is_ai = ours && (body == thinking || sent_by_bot(&atts));
     let body = resolve_mentions(manager, names, &body, &dm.body_ranges).await;
     let speaker = names.of(manager, &content.metadata.sender).await;
     let thread = Thread::try_from(content).ok();
@@ -366,7 +355,6 @@ pub async fn message_version<S: Store>(
         speaker,
         reply_to,
         body,
-        images,
-        audio,
+        atts,
     })
 }

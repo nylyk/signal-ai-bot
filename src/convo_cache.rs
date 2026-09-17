@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use crate::tools::Catalog;
+
 // entries older than this are evicted. measured from insertion, but a
 // continuation inserts a fresh child entry (and drops its parent), so an active
 // conversation keeps resetting its age — in effect, 12h since its last answer.
@@ -15,6 +17,9 @@ const TTL: Duration = Duration::from_secs(12 * 60 * 60);
 pub struct Cached {
     pub convo: Vec<serde_json::Value>,
     pub chat_context: String,
+    // the attachment ids already shown to the model, so a continuation keeps
+    // addressing the same attachment by the same id
+    pub catalog: Catalog,
     pub tip_ts: u64,
 }
 

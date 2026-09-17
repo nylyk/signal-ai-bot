@@ -1,40 +1,58 @@
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
 use presage::libsignal_service::content::DataMessage;
 use presage::libsignal_service::proto::data_message::Quote;
-use presage::libsignal_service::proto::AttachmentPointer;
 use presage::manager::Registered;
 use presage::model::messages::Received;
-use presage::store::{ContentExt, Store};
+use presage::store::{ContentExt, Store, Thread};
 use presage::Manager;
 use tracing::{error, info};
 
-use crate::ai::Phase;
-use crate::audio::fetch_audio;
+use crate::ai::{Phase, ToolCall};
 use crate::config::Config;
 use crate::convo_cache::{Cached, ConvoCache};
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
+use crate::media::{decode_data_uri, fetch_media, Media};
 use crate::message::{
-    ai_root_ts, content_audio, content_images, extract, is_ai_message, resolve_author,
-    resolve_mentions, ReplyRef, Trigger,
+    ai_root_ts, content_attachments, extract, is_ai_message, resolve_author, resolve_mentions,
+    ReplyRef, Trigger,
 };
 use crate::names::Names;
 use crate::prune::prune_old_messages;
-use crate::recipient::{send_edit, send_to, Recipient};
+use crate::recipient::{send_attachments, send_edit, send_to, upload, Recipient};
+use crate::tools::{self, Catalog, Inline};
 
 // how many finished conversations to keep warm for continuation
 const CONVO_CACHE_CAP: usize = 20;
 // how often to sweep the store for messages past the retention window
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_AI_REQUESTS: usize = 4;
+const EMPTY_ANSWER: &str = "(empty response)";
+// stands in for a replied-to attachment the store no longer has
+const MISSING_QUOTED: &str =
+    "[the attachment on the message being replied to is no longer available]";
 
 pub(crate) fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time went backwards")
         .as_millis() as u64
+}
+
+fn call_key(call: &ToolCall) -> (String, String) {
+    (call.name.clone(), call.arguments.clone())
+}
+
+// `text` cut to `max` characters, for sending somewhere a full one won't fit
+fn truncated(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_string(),
+    }
 }
 
 fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> String {
@@ -80,61 +98,45 @@ fn user_turn_value(text: String, media: &Media) -> serde_json::Value {
             "input_audio": { "data": data, "format": "wav" }
         }));
     }
+    for (name, data) in &media.files {
+        parts.push(serde_json::json!({
+            "type": "file",
+            "file": { "filename": name, "file_data": data }
+        }));
+    }
     serde_json::json!({ "role": "user", "content": parts })
 }
 
-// the encoded attachments of one turn: images as (mime, base64), audio as
-// base64 wav clips of at most 30s each
-#[derive(Default)]
-struct Media {
-    images: Vec<(String, String)>,
-    audio: Vec<String>,
-}
-
-impl Media {
-    fn is_empty(&self) -> bool {
-        self.images.is_empty() && self.audio.is_empty()
-    }
-}
-
-// download whichever of a message's attachments the enabled modalities cover
-async fn fetch_media<S: Store>(
-    manager: &mut Manager<S, Registered>,
-    cfg: &Config,
-    images: &[AttachmentPointer],
-    audio: &[AttachmentPointer],
-) -> Media {
-    Media {
-        images: if cfg.vision {
-            fetch_images(manager, images).await
-        } else {
-            Vec::new()
-        },
-        audio: if cfg.audio {
-            fetch_audio(manager, audio, cfg.audio_speed).await
-        } else {
-            Vec::new()
-        },
-    }
+struct Ctx<'a> {
+    names: &'a Names,
+    cfg: &'a Config,
+    thread: &'a Thread,
+    catalog: &'a mut Catalog,
 }
 
 // turn a window of history into chat messages. the bot's own answers become
-// `assistant` turns; everyone else's become `user` turns carrying that message's
-// own attachments (fetched only for the modalities that are on).
-async fn history_turns<S: Store>(
-    manager: &mut Manager<S, Registered>,
-    cfg: &Config,
-    history: &[HistMsg],
-) -> Vec<serde_json::Value> {
+// `assistant` turns; everyone else's become `user` turns. attachments are only
+// listed here, for the model to load if it wants them.
+fn history_turns(ctx: &mut Ctx<'_>, history: &[HistMsg]) -> Vec<serde_json::Value> {
+    let cfg = ctx.cfg;
     let mut turns = Vec::with_capacity(history.len());
     for h in history {
+        let note = ctx.catalog.announce(cfg, &h.atts, Inline::Listed);
         if h.is_ai {
-            turns.push(serde_json::json!({ "role": "assistant", "content": h.text.clone() }));
+            let mut text = h.text.clone();
+            if !note.is_empty() {
+                text.push('\n');
+                text.push_str(&note);
+            }
+            turns.push(serde_json::json!({ "role": "assistant", "content": text }));
             continue;
         }
-        let media = fetch_media(manager, cfg, &h.images, &h.audio).await;
-        let text = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
-        turns.push(user_turn_value(text, &media));
+        let mut text = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
+        if !note.is_empty() {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        turns.push(user_turn_value(text, &Media::default()));
     }
     turns
 }
@@ -146,17 +148,16 @@ async fn history_turns<S: Store>(
 // note from before the window.
 async fn trigger_turn<S: Store>(
     manager: &mut Manager<S, Registered>,
-    names: &Names,
-    cfg: &Config,
+    ctx: &mut Ctx<'_>,
     sender: &str,
     trigger: &Trigger,
     reply_to_ai: bool,
-    window: &[HistMsg],
 ) -> (serde_json::Value, Media) {
+    let cfg = ctx.cfg;
     let reply_to = if trigger.is_reply() {
         let author = resolve_author(
             manager,
-            names,
+            ctx.names,
             Some(&trigger.thread),
             trigger.quoted_author,
             trigger.quoted_ts,
@@ -172,40 +173,51 @@ async fn trigger_turn<S: Store>(
     };
     // keep the @ai prefix so this turn matches the past trigger messages in
     // context rather than looking stripped
-    let q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
+    let mut q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
+    let mut notes = vec![ctx.catalog.announce(cfg, &trigger.own_atts, Inline::Shown)];
 
-    let mut media = fetch_media(manager, cfg, &trigger.own_images, &trigger.own_audio).await;
+    let mut media = fetch_media(manager, cfg, &trigger.own_atts).await;
 
-    // directly-quoted media the model can't already see in this window: prefer
-    // the full original from the local store, falling back to the quote's
-    // embedded thumbnail when that yields nothing. a quote only ever embeds
-    // still-image thumbnails, so audio has no such fallback.
+    // a reply is the clearest signal that the quoted media matters, so it is
+    // always sent inline: prefer the full original from the local store, falling
+    // back to the quote's embedded thumbnail when that yields nothing. a quote
+    // only ever embeds still-image thumbnails, so audio has no such fallback.
     match trigger.quoted_ts {
-        Some(qts) if !window.iter().any(|h| h.ts == qts) => {
+        Some(qts) => {
             let orig = manager
                 .store()
                 .message(&trigger.thread, qts)
                 .await
                 .ok()
                 .flatten();
-            let img_ptrs = orig.as_ref().map(content_images).unwrap_or_default();
-            let aud_ptrs = orig.as_ref().map(content_audio).unwrap_or_default();
-            let mut quoted = fetch_media(manager, cfg, &img_ptrs, &aud_ptrs).await;
+            let found = orig.is_some();
+            let ptrs = orig.as_ref().map(content_attachments).unwrap_or_default();
+            notes.push(ctx.catalog.announce(cfg, &ptrs, Inline::Shown));
+            let mut quoted = fetch_media(manager, cfg, &ptrs).await;
             let used_thumb = cfg.vision && quoted.images.is_empty();
             if used_thumb {
                 quoted.images = fetch_images(manager, &trigger.quoted_thumbnails).await;
             }
             info!(
-                store_images = img_ptrs.len(),
-                store_audio = aud_ptrs.len(),
+                quoted_ts = qts,
+                found,
+                store_atts = ptrs.len(),
                 thumb_ptrs = trigger.quoted_thumbnails.len(),
                 images = quoted.images.len(),
                 audio = quoted.audio.len(),
+                files = quoted.files.len(),
                 used_thumb,
                 "resolved reply media"
             );
+            // a quote embeds a thumbnail per attachment, so it shows one was
+            // there even when the message itself is gone from the store
+            let had_attachment = !ptrs.is_empty() || !trigger.quoted_thumbnails.is_empty();
+            if quoted.is_empty() && had_attachment {
+                notes.push(MISSING_QUOTED.to_string());
+            }
             media.images.extend(quoted.images);
             media.audio.extend(quoted.audio);
+            media.files.extend(quoted.files);
         }
         None if cfg.vision && !trigger.quoted_thumbnails.is_empty() => {
             media
@@ -215,22 +227,25 @@ async fn trigger_turn<S: Store>(
         _ => {}
     }
 
+    for note in notes.iter().filter(|n| !n.is_empty()) {
+        q.push('\n');
+        q.push_str(note);
+    }
+
     (user_turn_value(q, &media), media)
 }
 
 // a fresh conversation: the last-N window turned into turns, then the trigger
 async fn build_convo<S: Store>(
     manager: &mut Manager<S, Registered>,
-    names: &Names,
-    cfg: &Config,
+    ctx: &mut Ctx<'_>,
     sender: &str,
     trigger: &Trigger,
     reply_to_ai: bool,
     history: &[HistMsg],
 ) -> (Vec<serde_json::Value>, Media) {
-    let mut convo = history_turns(manager, cfg, history).await;
-    let (turn, media) =
-        trigger_turn(manager, names, cfg, sender, trigger, reply_to_ai, history).await;
+    let mut convo = history_turns(ctx, history);
+    let (turn, media) = trigger_turn(manager, ctx, sender, trigger, reply_to_ai).await;
     convo.push(turn);
     (convo, media)
 }
@@ -253,12 +268,13 @@ struct TriggerRef {
 // so the caller can cache the finished conversation for continuation.
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
-    cfg: &Config,
+    ctx: &Ctx<'_>,
     recipient: Recipient,
     trigger: &TriggerRef,
-    convo: Vec<serde_json::Value>,
+    mut convo: Vec<serde_json::Value>,
     chat_context: &str,
 ) -> anyhow::Result<(u64, u64, String, Vec<serde_json::Value>)> {
+    let cfg = ctx.cfg;
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
     let placeholder_ts = now_ts().max(trigger.ts + 1);
@@ -280,54 +296,135 @@ async fn handle_trigger<S: Store>(
     };
     send_to(manager, &recipient, placeholder.into(), placeholder_ts).await?;
 
-    let (tx, mut rx) = mpsc::unbounded();
     let mut last_ts = placeholder_ts;
-    let stream = cfg.ai.complete(&convo, chat_context, move |p| {
-        let _ = tx.unbounded_send(p);
-    });
-    let edits = async {
-        let mut shown: Option<Phase> = None;
-        while let Some(mut phase) = rx.next().await {
-            // skip to the newest phase if more piled up
-            while let Ok(p) = rx.try_recv() {
-                phase = p;
-            }
-            if shown == Some(phase) {
-                continue;
-            }
-            shown = Some(phase);
-            let msg = match phase {
-                Phase::Reasoning => &cfg.reasoning_msg,
-                Phase::Generating => &cfg.generating_msg,
-            };
-            // each edit targets the previous revision, not the original, or the
-            // client renders it as a separate message
-            let edit_ts = now_ts().max(last_ts + 1);
-            if let Err(e) = send_edit(
-                manager,
-                &recipient,
-                last_ts,
-                msg.clone(),
-                edit_ts,
-                Some(quote.clone()),
-            )
-            .await
-            {
-                error!(%e, "phase edit failed");
-            }
-            last_ts = edit_ts;
-        }
-    };
-    let (result, ()) = join(stream, edits).await;
+    let mut shown: Option<Phase> = None;
+    let mut answer = String::new();
+    let mut generated: Vec<String> = Vec::new();
+    // tool calls already made and answered; repeating one means the model is
+    // going in circles rather than making progress
+    let mut spent: HashSet<(String, String)> = HashSet::new();
+    let mut needs_conclusion = false;
 
-    let answer = match result {
-        Ok(a) if !a.is_empty() => a,
-        Ok(_) => "(empty response)".to_string(),
-        Err(e) => {
-            error!(%e, "ai request failed");
-            format!("ai error: {e}")
+    for round in 0..MAX_AI_REQUESTS {
+        let (tx, mut rx) = mpsc::unbounded();
+        let stream = cfg.ai.complete(&convo, chat_context, move |p| {
+            let _ = tx.unbounded_send(p);
+        });
+        let edits = async {
+            while let Some(mut phase) = rx.next().await {
+                // skip to the newest phase if more piled up
+                while let Ok(p) = rx.try_recv() {
+                    phase = p;
+                }
+                if shown == Some(phase) {
+                    continue;
+                }
+                shown = Some(phase);
+                let msg = match phase {
+                    Phase::Reasoning => &cfg.reasoning_msg,
+                    Phase::Generating => &cfg.generating_msg,
+                    Phase::Tool => &cfg.tool_msg,
+                };
+                // each edit targets the previous revision, not the original, or
+                // the client renders it as a separate message
+                let edit_ts = now_ts().max(last_ts + 1);
+                if let Err(e) = send_edit(
+                    manager,
+                    &recipient,
+                    last_ts,
+                    msg.clone(),
+                    edit_ts,
+                    Some(quote.clone()),
+                )
+                .await
+                {
+                    error!(%e, "phase edit failed");
+                }
+                last_ts = edit_ts;
+            }
+        };
+        let (result, ()) = join(stream, edits).await;
+
+        let turn = match result {
+            Ok(turn) => turn,
+            Err(e) => {
+                error!(%e, "ai request failed");
+                answer = format!("ai error: {}", truncated(&e.to_string(), 200));
+                break;
+            }
+        };
+        generated.extend(turn.images);
+
+        if turn.calls.is_empty() {
+            answer = turn.text;
+            break;
         }
-    };
+        // every call is recorded before the verdict; a short-circuiting
+        // iterator method would leave later ones out of `spent`
+        let mut repeating = true;
+        for call in &turn.calls {
+            repeating &= !spent.insert(call_key(call));
+        }
+        if repeating || round + 1 == MAX_AI_REQUESTS {
+            needs_conclusion = true;
+            break;
+        }
+        convo.push(turn.assistant);
+        // media can't ride in a tool result, so it follows as user turns once
+        // every call has been answered
+        let mut follow_ups = Vec::new();
+        for call in &turn.calls {
+            let result =
+                tools::dispatch(manager, cfg, ctx.names, ctx.thread, ctx.catalog, call).await;
+            convo.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": result.content.clone(),
+            }));
+            if let Some(media) = result.media {
+                follow_ups.push(user_turn_value(result.content, &media));
+            }
+        }
+        convo.extend(follow_ups);
+    }
+
+    // out of rounds, or repeating itself: ask once more with no tools, so the
+    // reply is an answer rather than a report of our own limit
+    if needs_conclusion {
+        match cfg.ai.conclude(&convo, chat_context).await {
+            Ok(text) if !text.trim().is_empty() => answer = text,
+            Ok(_) => {}
+            Err(e) => error!(%e, "concluding without tools failed"),
+        }
+    }
+
+    // a provider-run image tool ends the turn with no words of its own
+    if !generated.is_empty() && answer.trim().is_empty() {
+        match cfg.ai.caption(&convo, chat_context, &generated).await {
+            Ok(line) if !line.trim().is_empty() => answer = line,
+            Ok(_) => {}
+            Err(e) => error!(%e, "captioning generated images failed"),
+        }
+    }
+    let mut attachments = Vec::new();
+    if !generated.is_empty() {
+        info!(count = generated.len(), "posting generated images");
+    }
+    for uri in &generated {
+        let Some((mime, bytes)) = decode_data_uri(uri) else {
+            error!("generated image was not a readable data uri");
+            continue;
+        };
+        match upload(manager, mime, bytes).await {
+            Ok(pointer) => attachments.push(pointer),
+            Err(e) => error!(%e, "uploading generated image failed"),
+        }
+    }
+
+    // only now is it certain nothing at all is going to be sent
+    if answer.trim().is_empty() && attachments.is_empty() {
+        answer = EMPTY_ANSWER.to_string();
+    }
 
     let edit_ts = now_ts().max(last_ts + 1);
     if let Err(e) = send_edit(
@@ -341,6 +438,15 @@ async fn handle_trigger<S: Store>(
     .await
     {
         error!(%e, "edit failed");
+    }
+
+    // an edit can't carry attachments — signal clients drop them — so generated
+    // images follow as their own message
+    if !attachments.is_empty() {
+        let ts = now_ts().max(edit_ts + 1);
+        if let Err(e) = send_attachments(manager, &recipient, attachments, ts).await {
+            error!(%e, "sending generated images failed");
+        }
     }
 
     Ok((placeholder_ts, edit_ts, answer, convo))
@@ -372,7 +478,7 @@ async fn process_content<S: Store>(
     // allow a media-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
     let only_trigger = trimmed.is_empty() || trimmed == cfg.trigger;
-    if only_trigger && t.own_images.is_empty() && t.own_audio.is_empty() && !is_reply {
+    if only_trigger && t.own_atts.is_empty() && !is_reply {
         return;
     }
     let recipient = Recipient::from_thread(&t.thread);
@@ -389,11 +495,21 @@ async fn process_content<S: Store>(
         _ => None,
     };
     // clone eagerly so the cache borrow ends before we build the new turn
-    let hit = parent_root
-        .and_then(|r| cache.get(r))
-        .map(|c| (c.convo.clone(), c.chat_context.clone(), c.tip_ts));
+    let (cached, mut catalog) = match parent_root.and_then(|r| cache.get(r)) {
+        Some(c) => (
+            Some((c.convo.clone(), c.chat_context.clone(), c.tip_ts)),
+            c.catalog.clone(),
+        ),
+        None => (None, Catalog::default()),
+    };
+    let mut ctx = Ctx {
+        names,
+        cfg,
+        thread: &t.thread,
+        catalog: &mut catalog,
+    };
 
-    let (convo, media, chat_context, context) = match hit {
+    let (convo, media, chat_context, context) = match cached {
         Some((cached_convo, cached_context, tip_ts)) => {
             // reuse the cached array (its media included), append whatever was
             // written since (with theirs), then this turn. the reused prefix
@@ -401,9 +517,8 @@ async fn process_content<S: Store>(
             let between =
                 thread_history(manager, &t.thread, tip_ts, trigger_ts, None, cfg, names).await;
             let mut convo = cached_convo;
-            convo.extend(history_turns(manager, cfg, &between).await);
-            let (turn, media) =
-                trigger_turn(manager, names, cfg, &sender, &t, reply_to_ai, &between).await;
+            convo.extend(history_turns(&mut ctx, &between));
+            let (turn, media) = trigger_turn(manager, &mut ctx, &sender, &t, reply_to_ai).await;
             convo.push(turn);
             (convo, media, cached_context, between.len())
         }
@@ -421,7 +536,7 @@ async fn process_content<S: Store>(
             )
             .await;
             let (convo, media) =
-                build_convo(manager, names, cfg, &sender, &t, reply_to_ai, &history).await;
+                build_convo(manager, &mut ctx, &sender, &t, reply_to_ai, &history).await;
             let chat_context = names.chat_context(manager, &t.thread).await;
             (convo, media, chat_context, history.len())
         }
@@ -438,7 +553,7 @@ async fn process_content<S: Store>(
     );
     match handle_trigger(
         manager,
-        cfg,
+        &ctx,
         recipient,
         &TriggerRef {
             ts: trigger_ts,
@@ -452,7 +567,7 @@ async fn process_content<S: Store>(
     {
         Ok((root_ts, tip_ts, answer, mut convo)) => {
             // don't cache error/empty sentinels, so a retry rebuilds cleanly
-            let is_error = answer == "(empty response)" || answer.starts_with("ai error:");
+            let is_error = answer == EMPTY_ANSWER || answer.starts_with("ai error:");
             if !is_error {
                 convo.push(serde_json::json!({ "role": "assistant", "content": answer }));
                 cache.insert(
@@ -460,6 +575,7 @@ async fn process_content<S: Store>(
                     Cached {
                         convo,
                         chat_context,
+                        catalog,
                         tip_ts,
                     },
                 );

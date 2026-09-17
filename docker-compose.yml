@@ -14,10 +14,13 @@ services:
       # only for models that accept them, e.g. gemma 4 E2B/E4B/12B for audio
       VISION: "false"
       AUDIO: "false"
+      DOCUMENTS: "false"
+      # EXTRA_TOOLS: '[{"type":"openrouter:web_search"}]'
       TRIGGER: "@ai"
       PROCESSING_MESSAGE: AI is processing...
       REASONING_MESSAGE: AI is thinking...
       GENERATING_MESSAGE: AI is writing...
+      TOOL_MESSAGE: AI is looking things up...
       CONTEXT_MESSAGES: 10
       REASONING_BUDGET: 400
       DEVICE_NAME: signal-ai-bot-dev

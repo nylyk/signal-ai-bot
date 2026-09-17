@@ -15,8 +15,7 @@ pub struct HistMsg {
     pub reply_to: Option<ReplyRef>,
     pub text: String,
     // the message's own attachments (empty for the bot's own answers)
-    pub images: Vec<AttachmentPointer>,
-    pub audio: Vec<AttachmentPointer>,
+    pub atts: Vec<AttachmentPointer>,
     // the collapsed root timestamp, used to dedupe a directly-quoted image that
     // is already present in this window
     pub ts: u64,
@@ -47,6 +46,7 @@ pub async fn thread_history<S: Store>(
         cfg.processing_msg.as_str(),
         cfg.reasoning_msg.as_str(),
         cfg.generating_msg.as_str(),
+        cfg.tool_msg.as_str(),
     ];
     let Ok(iter) = manager.store().messages(thread, 0..before_ts).await else {
         return Vec::new();
@@ -88,8 +88,7 @@ pub async fn thread_history<S: Store>(
                         speaker: v.speaker,
                         reply_to: v.reply_to,
                         text: v.body,
-                        images: v.images,
-                        audio: v.audio,
+                        atts: v.atts,
                         ts: root,
                     },
                 );
@@ -104,11 +103,7 @@ pub async fn thread_history<S: Store>(
     out.retain(|m| !(m.is_ai && status_msgs.contains(&m.text.as_str())));
     // a media-only message is worth a turn only if we'll actually send its
     // media, else it would surface as a bare "alice: " with nothing attached
-    out.retain(|m| {
-        !m.text.is_empty()
-            || (cfg.vision && !m.images.is_empty())
-            || (cfg.audio && !m.audio.is_empty())
-    });
+    out.retain(|m| !m.text.is_empty() || !m.atts.is_empty());
     out.sort_by_key(|m| m.ts);
     // a reply's chain collapses to one entry above; if it ever fails to,
     // adjacent entries carry the same answer text, so fold them back together

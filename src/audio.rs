@@ -138,7 +138,8 @@ pub async fn fetch_audio<S: Store>(
     speed: f32,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for (mime, data) in fetch_raw(manager, ptrs, "audio").await {
+    for (p, data) in fetch_raw(manager, ptrs, "audio").await {
+        let mime = p.content_type();
         let pcm = match transcode(&data, speed).await {
             Ok(p) if !p.is_empty() => p,
             Ok(_) => {

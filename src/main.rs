@@ -10,6 +10,7 @@ mod message;
 mod names;
 mod prune;
 mod recipient;
+mod tools;
 
 use anyhow::Context as _;
 use futures::{channel::oneshot, future};
