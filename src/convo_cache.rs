@@ -30,11 +30,14 @@ struct Entry {
 
 // process-lifetime cache of conversations keyed by the bot answer's root
 // (placeholder) timestamp — the same value a later reply resolves to via
-// `ai_root_ts`. bounded by `cap` (oldest-inserted evicted first) and by `TTL`.
+// `ai_root_ts`. messages of the same answer that sit outside its edit chain
+// (generated images travel as their own message) reach the entry through
+// `aliases`. bounded by `cap` (oldest-inserted evicted first) and by `TTL`.
 pub struct ConvoCache {
     cap: usize,
     entries: HashMap<u64, Entry>,
     order: VecDeque<u64>,
+    aliases: HashMap<u64, u64>,
 }
 
 impl ConvoCache {
@@ -43,10 +46,12 @@ impl ConvoCache {
             cap,
             entries: HashMap::new(),
             order: VecDeque::new(),
+            aliases: HashMap::new(),
         }
     }
 
-    pub fn get(&mut self, root_ts: u64) -> Option<&Cached> {
+    pub fn get(&mut self, ts: u64) -> Option<&Cached> {
+        let root_ts = self.aliases.get(&ts).copied().unwrap_or(ts);
         // an aged-out entry is a miss (and gets dropped on the way)
         if self
             .entries
@@ -58,25 +63,38 @@ impl ConvoCache {
         self.entries.get(&root_ts).map(|e| &e.cached)
     }
 
+    // let a reply to `ts` resolve to the answer rooted at `root_ts`
+    pub fn alias(&mut self, ts: u64, root_ts: u64) {
+        if self.entries.contains_key(&root_ts) {
+            self.aliases.insert(ts, root_ts);
+        }
+    }
+
     pub fn insert(&mut self, root_ts: u64, cached: Cached) {
         self.purge_expired();
         let entry = Entry {
             created: Instant::now(),
             cached,
         };
+        // a timestamp is either a root or an alias, never both
+        self.aliases.remove(&root_ts);
         if self.entries.insert(root_ts, entry).is_none() {
             self.order.push_back(root_ts);
         }
         while self.order.len() > self.cap {
-            if let Some(oldest) = self.order.pop_front() {
-                self.entries.remove(&oldest);
-            }
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+            self.aliases.retain(|_, &mut r| r != oldest);
         }
     }
 
-    pub fn remove(&mut self, root_ts: u64) {
+    pub fn remove(&mut self, ts: u64) {
+        let root_ts = self.aliases.get(&ts).copied().unwrap_or(ts);
         if self.entries.remove(&root_ts).is_some() {
             self.order.retain(|&t| t != root_ts);
+            self.aliases.retain(|_, &mut r| r != root_ts);
         }
     }
 

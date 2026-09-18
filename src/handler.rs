@@ -259,13 +259,9 @@ struct TriggerRef {
 }
 
 // post the placeholder, edit it through each phase as the completion streams,
-// then edit it into the answer. returns every timestamp we wrote (placeholder,
-// each phase edit, final) plus the answer. presage persists these edits as
-// separate rows keyed by their own timestamp, so the caller records the answer
-// under all of them: that way any row of the chain is recognised as ours rather
-// than leaking back into context as an owner message.
-// returns (answer root ts, answer tip ts, answer text, the convo it was given),
-// so the caller can cache the finished conversation for continuation.
+// then edit it into the answer. returns (answer root ts, answer tip ts, the
+// generated-image message's ts if one was sent, answer text, the convo it was
+// given), so the caller can cache the finished conversation for continuation.
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
     ctx: &Ctx<'_>,
@@ -273,7 +269,7 @@ async fn handle_trigger<S: Store>(
     trigger: &TriggerRef,
     mut convo: Vec<serde_json::Value>,
     chat_context: &str,
-) -> anyhow::Result<(u64, u64, String, Vec<serde_json::Value>)> {
+) -> anyhow::Result<(u64, u64, Option<u64>, String, Vec<serde_json::Value>)> {
     let cfg = ctx.cfg;
     // post the placeholder, forced strictly after the trigger so it sorts after
     // the prompt regardless of clock skew
@@ -442,14 +438,16 @@ async fn handle_trigger<S: Store>(
 
     // an edit can't carry attachments — signal clients drop them — so generated
     // images follow as their own message
+    let mut image_ts = None;
     if !attachments.is_empty() {
         let ts = now_ts().max(edit_ts + 1);
-        if let Err(e) = send_attachments(manager, &recipient, attachments, ts).await {
-            error!(%e, "sending generated images failed");
+        match send_attachments(manager, &recipient, attachments, ts).await {
+            Ok(()) => image_ts = Some(ts),
+            Err(e) => error!(%e, "sending generated images failed"),
         }
     }
 
-    Ok((placeholder_ts, edit_ts, answer, convo))
+    Ok((placeholder_ts, edit_ts, image_ts, answer, convo))
 }
 
 async fn process_content<S: Store>(
@@ -565,7 +563,7 @@ async fn process_content<S: Store>(
     )
     .await
     {
-        Ok((root_ts, tip_ts, answer, mut convo)) => {
+        Ok((root_ts, tip_ts, image_ts, answer, mut convo)) => {
             // don't cache error/empty sentinels, so a retry rebuilds cleanly
             let is_error = answer == EMPTY_ANSWER || answer.starts_with("ai error:");
             if !is_error {
@@ -579,6 +577,11 @@ async fn process_content<S: Store>(
                         tip_ts,
                     },
                 );
+                // a generated image is its own message, outside the edit chain
+                // `ai_root_ts` walks, so point it at the answer explicitly
+                if let Some(ts) = image_ts {
+                    cache.alias(ts, root_ts);
+                }
                 // the answer we continued from is now superseded by this child
                 if let Some(p) = parent_root {
                     cache.remove(p);
