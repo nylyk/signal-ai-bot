@@ -5,11 +5,12 @@ use anyhow::Context as _;
 use futures::{channel::mpsc, future::join, pin_mut, StreamExt};
 use presage::libsignal_service::content::DataMessage;
 use presage::libsignal_service::proto::data_message::Quote;
+use presage::libsignal_service::proto::AttachmentPointer;
 use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, Store, Thread};
 use presage::Manager;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::ai::{Phase, ToolCall};
 use crate::config::Config;
@@ -24,7 +25,8 @@ use crate::message::{
 use crate::names::Names;
 use crate::prune::prune_old_messages;
 use crate::recipient::{send_attachments, send_edit, send_to, upload, Recipient};
-use crate::tools::{self, Catalog, Inline};
+use crate::tools::{self, same_file, Inline};
+use crate::transcript::{user_turn_value, Transcript};
 
 // how many finished conversations to keep warm for continuation
 const CONVO_CACHE_CAP: usize = 20;
@@ -48,109 +50,30 @@ fn call_key(call: &ToolCall) -> (String, String) {
 }
 
 // `text` cut to `max` characters, for sending somewhere a full one won't fit
-fn truncated(text: &str, max: usize) -> String {
+pub(crate) fn truncated(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
         None => text.to_string(),
     }
 }
 
-fn format_user_turn(speaker: &str, reply_to: Option<&ReplyRef>, body: &str) -> String {
-    let mut s = String::new();
-    if let Some(r) = reply_to {
-        s.push_str("[in reply to ");
-        if r.is_ai {
-            s.push_str("you");
-        } else {
-            s.push_str(&r.author);
-        }
-        if !r.text.is_empty() {
-            // collapse newlines so the quote stays on the annotation line
-            s.push_str(&format!(", who wrote: \"{}\"", r.text.replace('\n', " ")));
-        }
-        s.push_str("]:\n");
-    }
-    s.push_str(speaker);
-    s.push_str(": ");
-    s.push_str(body);
-    s
-}
-
-// a `user` turn: plain string content when there's no media, else a multimodal
-// parts array with the text, then each image as an image_url, then each audio
-// clip. audio goes last because gemma 4 asks for it after the text, and it
-// carries raw base64 rather than a data uri — llama.cpp only unwraps `data:`
-// uris for images.
-fn user_turn_value(text: String, media: &Media) -> serde_json::Value {
-    if media.is_empty() {
-        return serde_json::json!({ "role": "user", "content": text });
-    }
-    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
-    for (mime, data) in &media.images {
-        parts.push(serde_json::json!({
-            "type": "image_url",
-            "image_url": { "url": format!("data:{mime};base64,{data}") }
-        }));
-    }
-    for data in &media.audio {
-        parts.push(serde_json::json!({
-            "type": "input_audio",
-            "input_audio": { "data": data, "format": "wav" }
-        }));
-    }
-    for (name, data) in &media.files {
-        parts.push(serde_json::json!({
-            "type": "file",
-            "file": { "filename": name, "file_data": data }
-        }));
-    }
-    serde_json::json!({ "role": "user", "content": parts })
-}
-
 struct Ctx<'a> {
     names: &'a Names,
     cfg: &'a Config,
     thread: &'a Thread,
-    catalog: &'a mut Catalog,
-}
-
-// turn a window of history into chat messages. the bot's own answers become
-// `assistant` turns; everyone else's become `user` turns. attachments are only
-// listed here, for the model to load if it wants them.
-fn history_turns(ctx: &mut Ctx<'_>, history: &[HistMsg]) -> Vec<serde_json::Value> {
-    let cfg = ctx.cfg;
-    let mut turns = Vec::with_capacity(history.len());
-    for h in history {
-        let note = ctx.catalog.announce(cfg, &h.atts, Inline::Listed);
-        if h.is_ai {
-            let mut text = h.text.clone();
-            if !note.is_empty() {
-                text.push('\n');
-                text.push_str(&note);
-            }
-            turns.push(serde_json::json!({ "role": "assistant", "content": text }));
-            continue;
-        }
-        let mut text = format_user_turn(&h.speaker, h.reply_to.as_ref(), &h.text);
-        if !note.is_empty() {
-            text.push('\n');
-            text.push_str(&note);
-        }
-        turns.push(user_turn_value(text, &Media::default()));
-    }
-    turns
+    transcript: &'a mut Transcript,
 }
 
 // the final `user` turn for the triggering message: its text plus its own
-// attachments. `window` is the set of turns already in the array; directly-quoted
-// media is added only when the quoted message isn't already one of them (so an
-// in-window attachment isn't sent twice), covering replies to a photo or voice
-// note from before the window.
+// attachments. the quoted message's media rides along too — a reply is the
+// clearest signal that it matters — unless this conversation already carries it
+// inline, in which case the annotation points back at the copy that's there.
 async fn trigger_turn<S: Store>(
     manager: &mut Manager<S, Registered>,
     ctx: &mut Ctx<'_>,
     sender: &str,
     trigger: &Trigger,
+    trigger_ts: u64,
     reply_to_ai: bool,
 ) -> (serde_json::Value, Media) {
     let cfg = ctx.cfg;
@@ -166,6 +89,7 @@ async fn trigger_turn<S: Store>(
         Some(ReplyRef {
             author,
             text: trigger.quoted_text.clone().unwrap_or_default(),
+            ts: trigger.quoted_ts,
             is_ai: reply_to_ai,
         })
     } else {
@@ -173,34 +97,47 @@ async fn trigger_turn<S: Store>(
     };
     // keep the @ai prefix so this turn matches the past trigger messages in
     // context rather than looking stripped
-    let mut q = format_user_turn(sender, reply_to.as_ref(), trigger.body.trim());
-    let mut notes = vec![ctx.catalog.announce(cfg, &trigger.own_atts, Inline::Shown)];
+    let mut q =
+        ctx.transcript
+            .user_text(trigger_ts, sender, reply_to.as_ref(), trigger.body.trim());
+    let mut notes = vec![ctx
+        .transcript
+        .announce(cfg, &trigger.own_atts, Inline::Shown)];
 
     let mut media = fetch_media(manager, cfg, &trigger.own_atts).await;
+    if !media.is_empty() {
+        ctx.transcript.mark_inlined(trigger_ts);
+    }
 
-    // a reply is the clearest signal that the quoted media matters, so it is
-    // always sent inline: prefer the full original from the local store, falling
-    // back to the quote's embedded thumbnail when that yields nothing. a quote
-    // only ever embeds still-image thumbnails, so audio has no such fallback.
+    // prefer the full original from the local store, falling back to the quote's
+    // embedded thumbnail when that yields nothing. a quote only ever embeds
+    // still-image thumbnails, so audio has no such fallback.
     match trigger.quoted_ts {
+        Some(qts) if ctx.transcript.is_inlined(qts) => {
+            let orig = stored_attachments(manager, &trigger.thread, qts).await;
+            notes.push(ctx.transcript.announce(cfg, &orig, Inline::Shown));
+            debug!(
+                quoted_ts = qts,
+                "quoted media already in context, not resending"
+            );
+        }
         Some(qts) => {
-            let orig = manager
-                .store()
-                .message(&trigger.thread, qts)
-                .await
-                .ok()
-                .flatten();
-            let found = orig.is_some();
-            let ptrs = orig.as_ref().map(content_attachments).unwrap_or_default();
-            notes.push(ctx.catalog.announce(cfg, &ptrs, Inline::Shown));
-            let mut quoted = fetch_media(manager, cfg, &ptrs).await;
-            let used_thumb = cfg.vision && quoted.images.is_empty();
+            let ptrs = stored_attachments(manager, &trigger.thread, qts).await;
+            notes.push(ctx.transcript.announce(cfg, &ptrs, Inline::Shown));
+            // a file attached to both messages is already encoded in this turn
+            let fresh: Vec<_> = ptrs
+                .iter()
+                .filter(|p| !trigger.own_atts.iter().any(|o| same_file(o, p)))
+                .cloned()
+                .collect();
+            let overlaps = fresh.len() < ptrs.len();
+            let mut quoted = fetch_media(manager, cfg, &fresh).await;
+            let used_thumb = cfg.vision && quoted.images.is_empty() && !overlaps;
             if used_thumb {
                 quoted.images = fetch_images(manager, &trigger.quoted_thumbnails).await;
             }
             info!(
                 quoted_ts = qts,
-                found,
                 store_atts = ptrs.len(),
                 thumb_ptrs = trigger.quoted_thumbnails.len(),
                 images = quoted.images.len(),
@@ -212,8 +149,11 @@ async fn trigger_turn<S: Store>(
             // a quote embeds a thumbnail per attachment, so it shows one was
             // there even when the message itself is gone from the store
             let had_attachment = !ptrs.is_empty() || !trigger.quoted_thumbnails.is_empty();
-            if quoted.is_empty() && had_attachment {
+            if quoted.is_empty() && had_attachment && !overlaps {
                 notes.push(MISSING_QUOTED.to_string());
+            }
+            if !quoted.is_empty() {
+                ctx.transcript.mark_inlined(qts);
             }
             media.images.extend(quoted.images);
             media.audio.extend(quoted.audio);
@@ -235,17 +175,34 @@ async fn trigger_turn<S: Store>(
     (user_turn_value(q, &media), media)
 }
 
+async fn stored_attachments<S: Store>(
+    manager: &Manager<S, Registered>,
+    thread: &Thread,
+    ts: u64,
+) -> Vec<AttachmentPointer> {
+    manager
+        .store()
+        .message(thread, ts)
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(content_attachments)
+        .unwrap_or_default()
+}
+
 // a fresh conversation: the last-N window turned into turns, then the trigger
 async fn build_convo<S: Store>(
     manager: &mut Manager<S, Registered>,
     ctx: &mut Ctx<'_>,
     sender: &str,
     trigger: &Trigger,
+    trigger_ts: u64,
     reply_to_ai: bool,
     history: &[HistMsg],
 ) -> (Vec<serde_json::Value>, Media) {
-    let mut convo = history_turns(ctx, history);
-    let (turn, media) = trigger_turn(manager, ctx, sender, trigger, reply_to_ai).await;
+    let mut convo = ctx.transcript.history_turns(ctx.cfg, history);
+    let (turn, media) = trigger_turn(manager, ctx, sender, trigger, trigger_ts, reply_to_ai).await;
     convo.push(turn);
     (convo, media)
 }
@@ -370,8 +327,15 @@ async fn handle_trigger<S: Store>(
         // every call has been answered
         let mut follow_ups = Vec::new();
         for call in &turn.calls {
-            let result =
-                tools::dispatch(manager, cfg, ctx.names, ctx.thread, ctx.catalog, call).await;
+            let result = tools::dispatch(
+                manager,
+                cfg,
+                ctx.names,
+                ctx.thread,
+                ctx.transcript.catalog(),
+                call,
+            )
+            .await;
             convo.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -499,18 +463,18 @@ async fn process_content<S: Store>(
         _ => None,
     };
     // clone eagerly so the cache borrow ends before we build the new turn
-    let (cached, mut catalog) = match parent_root.and_then(|r| cache.get(r)) {
+    let (cached, mut transcript) = match parent_root.and_then(|r| cache.get(r)) {
         Some(c) => (
             Some((c.convo.clone(), c.chat_context.clone(), c.tip_ts)),
-            c.catalog.clone(),
+            c.transcript.clone(),
         ),
-        None => (None, Catalog::default()),
+        None => (None, Transcript::default()),
     };
     let mut ctx = Ctx {
         names,
         cfg,
         thread: &t.thread,
-        catalog: &mut catalog,
+        transcript: &mut transcript,
     };
 
     let (convo, media, chat_context, context) = match cached {
@@ -521,8 +485,10 @@ async fn process_content<S: Store>(
             let between =
                 thread_history(manager, &t.thread, tip_ts, trigger_ts, None, cfg, names).await;
             let mut convo = cached_convo;
-            convo.extend(history_turns(&mut ctx, &between));
-            let (turn, media) = trigger_turn(manager, &mut ctx, &sender, &t, reply_to_ai).await;
+            let turns = ctx.transcript.history_turns(cfg, &between);
+            convo.extend(turns);
+            let (turn, media) =
+                trigger_turn(manager, &mut ctx, &sender, &t, trigger_ts, reply_to_ai).await;
             convo.push(turn);
             (convo, media, cached_context, between.len())
         }
@@ -539,8 +505,16 @@ async fn process_content<S: Store>(
                 names,
             )
             .await;
-            let (convo, media) =
-                build_convo(manager, &mut ctx, &sender, &t, reply_to_ai, &history).await;
+            let (convo, media) = build_convo(
+                manager,
+                &mut ctx,
+                &sender,
+                &t,
+                trigger_ts,
+                reply_to_ai,
+                &history,
+            )
+            .await;
             let chat_context = names.chat_context(manager, &t.thread).await;
             (convo, media, chat_context, history.len())
         }
@@ -579,7 +553,7 @@ async fn process_content<S: Store>(
                     Cached {
                         convo,
                         chat_context,
-                        catalog,
+                        transcript,
                         tip_ts,
                     },
                 );

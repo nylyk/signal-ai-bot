@@ -99,6 +99,8 @@ pub async fn resolve_author<S: Store>(
 pub struct ReplyRef {
     pub author: String,
     pub text: String,
+    // sent timestamp of the quoted message, its `[msg N]` key
+    pub ts: Option<u64>,
     // the quoted message is one of the bot's own AI replies
     pub is_ai: bool,
 }
@@ -224,6 +226,7 @@ async fn reply_ref<S: Store>(
     Some(ReplyRef {
         author,
         text,
+        ts: quote.id,
         is_ai,
     })
 }

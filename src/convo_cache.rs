@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::tools::Catalog;
+use crate::transcript::Transcript;
 
 // entries older than this are evicted. measured from insertion, but a
 // continuation inserts a fresh child entry (and drops its parent), so an active
@@ -17,9 +17,10 @@ const TTL: Duration = Duration::from_secs(12 * 60 * 60);
 pub struct Cached {
     pub convo: Vec<serde_json::Value>,
     pub chat_context: String,
-    // the attachment ids already shown to the model, so a continuation keeps
-    // addressing the same attachment by the same id
-    pub catalog: Catalog,
+    // the message and attachment numbering already shown to the model, and which
+    // attachments are inline, so a continuation keeps addressing everything by
+    // the same id and never resends media it already carries
+    pub transcript: Transcript,
     pub tip_ts: u64,
 }
 

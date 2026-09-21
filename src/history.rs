@@ -16,8 +16,8 @@ pub struct HistMsg {
     pub text: String,
     // the message's own attachments (empty for the bot's own answers)
     pub atts: Vec<AttachmentPointer>,
-    // the collapsed root timestamp, used to dedupe a directly-quoted image that
-    // is already present in this window
+    // the collapsed root timestamp: orders the window and keys the message's
+    // `[msg N]` number
     pub ts: u64,
 }
 

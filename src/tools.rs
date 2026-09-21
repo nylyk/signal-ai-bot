@@ -131,7 +131,7 @@ impl Catalog {
 // signal gives every upload its own digest, so the same file quoted from
 // outside the window is recognised as one already numbered. without a digest
 // there is nothing to compare, so it counts as a new attachment.
-fn same_file(a: &AttachmentPointer, b: &AttachmentPointer) -> bool {
+pub fn same_file(a: &AttachmentPointer, b: &AttachmentPointer) -> bool {
     match (a.digest.as_deref(), b.digest.as_deref()) {
         (Some(x), Some(y)) => x == y,
         _ => false,
