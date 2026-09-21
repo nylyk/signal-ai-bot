@@ -1,9 +1,10 @@
 # signal-ai-bot
 
 a signal client that runs an openai-compatible chatbot in your chats. start a
-message with `@ai` and the bot replies. works in 1:1 and group chats, with text,
-images (vision models) and voice messages (audio models), and uses recent
-messages as context.
+message with `@ai` and the bot replies. works in 1:1 and group chats, with
+text, images (vision models) and voice messages (audio models), and uses recent
+messages as context. digits right after the trigger shorten that window for one
+prompt — `@ai2` sees only the last two messages.
 
 ## run
 
@@ -30,7 +31,7 @@ set via env vars (see `docker-compose.yml`):
 | `DOCUMENTS`              | no       | off                          | send pdfs — only enable for models that read them    |
 | `EXTRA_TOOLS`            | no       | none                         | json array of tools the provider runs itself         |
 | `TRIGGER`                | no       | `@ai`                        | prefix that summons the bot                          |
-| `CONTEXT_MESSAGES`       | no       | `5`                          | recent messages fed as context                       |
+| `CONTEXT_MESSAGES`       | no       | `5`                          | recent messages fed as context (max; see `@ai2`)     |
 | `MESSAGE_RETENTION_DAYS` | no       | `7`                          | prune stored messages older than this; `0` keeps all |
 | `DEVICE_NAME`            | no       | `signal-ai-bot`              | name shown in signal's linked devices                |
 | `PROCESSING_MESSAGE`     | no       | `ai is processing...`        | placeholder while the model ingests the prompt       |

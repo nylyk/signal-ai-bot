@@ -171,13 +171,15 @@ impl AiClient {
 
         debug!(messages = %redact_media(&messages), "sending request to ai");
 
+        // reqwest prints the endpoint in its errors, which end up in the chat
         let resp = self
             .http
             .post(&url)
             .bearer_auth(&self.key)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         if !status.is_success() {
             let detail = resp.text().await.unwrap_or_default();
@@ -193,7 +195,7 @@ impl AiClient {
         let mut images: Vec<String> = Vec::new();
 
         'outer: while let Some(chunk) = stream.next().await {
-            buf.extend_from_slice(&chunk?);
+            buf.extend_from_slice(&chunk.map_err(reqwest::Error::without_url)?);
             // server-sent events: one `data: <json>` per line
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=nl).collect();

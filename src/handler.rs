@@ -18,8 +18,8 @@ use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
 use crate::media::{decode_data_uri, fetch_media, Media};
 use crate::message::{
-    ai_root_ts, content_attachments, extract, is_ai_message, resolve_author, resolve_mentions,
-    ReplyRef, Trigger,
+    ai_root_ts, content_attachments, extract, is_ai_message, requested_context, resolve_author,
+    resolve_mentions, ReplyRef, Trigger,
 };
 use crate::names::Names;
 use crate::prune::prune_old_messages;
@@ -475,10 +475,16 @@ async fn process_content<S: Store>(
     let is_reply = t.is_reply();
     // allow a media-only or reply-only prompt (e.g. a photo or a reply
     // captioned just "@ai")
-    let only_trigger = trimmed.is_empty() || trimmed == cfg.trigger;
+    let only_trigger =
+        trimmed.is_empty() || trimmed.trim_end_matches(|c: char| c.is_ascii_digit()) == cfg.trigger;
     if only_trigger && t.own_atts.is_empty() && !is_reply {
         return;
     }
+    // `@ai2` asks for a shorter window than the configured one; it can only
+    // narrow it
+    let context_messages = requested_context(trimmed, &cfg.trigger)
+        .unwrap_or(cfg.context_messages)
+        .min(cfg.context_messages);
     let recipient = Recipient::from_thread(&t.thread);
 
     let sender = names.of(manager, &content.metadata.sender).await;
@@ -528,7 +534,7 @@ async fn process_content<S: Store>(
                 &t.thread,
                 0,
                 trigger_ts,
-                Some(cfg.context_messages),
+                Some(context_messages),
                 cfg,
                 names,
             )

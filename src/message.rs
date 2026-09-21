@@ -123,6 +123,18 @@ impl Trigger {
     }
 }
 
+// digits written straight after the trigger, `@ai2`, asking for that many
+// context messages
+pub fn requested_context(body: &str, trigger: &str) -> Option<usize> {
+    let after = body.split_once(trigger)?.1;
+    after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 fn sent_by_bot(atts: &[AttachmentPointer]) -> bool {
     !atts.is_empty() && atts.iter().all(|a| a.file_name() == BOT_FILE_NAME)
 }
@@ -357,4 +369,17 @@ pub async fn message_version<S: Store>(
         body,
         atts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_context_count_after_the_trigger() {
+        assert_eq!(requested_context("@ai2 what's up", "@ai"), Some(2));
+        assert_eq!(requested_context("hey @ai12", "@ai"), Some(12));
+        assert_eq!(requested_context("@ai what's up", "@ai"), None);
+        assert_eq!(requested_context("nothing here", "@ai"), None);
+    }
 }
