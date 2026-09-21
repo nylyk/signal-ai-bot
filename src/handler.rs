@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -10,7 +11,8 @@ use presage::manager::Registered;
 use presage::model::messages::Received;
 use presage::store::{ContentExt, Store, Thread};
 use presage::Manager;
-use tracing::{debug, error, info};
+use tokio::sync::{Mutex, Semaphore};
+use tracing::{debug, error, info, warn};
 
 use crate::ai::{Phase, ToolCall};
 use crate::config::Config;
@@ -33,6 +35,10 @@ const CONVO_CACHE_CAP: usize = 20;
 // how often to sweep the store for messages past the retention window
 const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_AI_REQUESTS: usize = 4;
+// prompts handled at once. the receive loop hands each one to its own task so
+// the signal message pipe keeps draining — a long completion that blocks it
+// stops incoming envelopes being acknowledged and the server drops the socket.
+const MAX_CONCURRENT_PROMPTS: usize = 4;
 const EMPTY_ANSWER: &str = "(empty response)";
 // stands in for a replied-to attachment the store no longer has
 const MISSING_QUOTED: &str =
@@ -418,7 +424,7 @@ async fn process_content<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     names: &Names,
-    cache: &mut ConvoCache,
+    cache: &Mutex<ConvoCache>,
     content: &presage::libsignal_service::content::Content,
 ) {
     let Some(mut t) = extract(content) else {
@@ -462,14 +468,15 @@ async fn process_content<S: Store>(
         (true, Some(qts)) => ai_root_ts(manager, names, &t.thread, qts, &cfg.processing_msg).await,
         _ => None,
     };
-    // clone eagerly so the cache borrow ends before we build the new turn
-    let (cached, mut transcript) = match parent_root.and_then(|r| cache.get(r)) {
-        Some(c) => (
-            Some((c.convo.clone(), c.chat_context.clone(), c.tip_ts)),
-            c.transcript.clone(),
-        ),
-        None => (None, Transcript::default()),
-    };
+    // clone eagerly so the lock is released before we build the new turn
+    let mut cached = None;
+    let mut transcript = Transcript::default();
+    if let Some(root) = parent_root {
+        if let Some(c) = cache.lock().await.get(root) {
+            cached = Some((c.convo.clone(), c.chat_context.clone(), c.tip_ts));
+            transcript = c.transcript.clone();
+        }
+    }
     let mut ctx = Ctx {
         names,
         cfg,
@@ -548,6 +555,7 @@ async fn process_content<S: Store>(
             let is_error = answer == EMPTY_ANSWER || answer.starts_with("ai error:");
             if !is_error {
                 convo.push(serde_json::json!({ "role": "assistant", "content": answer }));
+                let mut cache = cache.lock().await;
                 cache.insert(
                     root_ts,
                     Cached {
@@ -573,15 +581,16 @@ async fn process_content<S: Store>(
 }
 
 pub enum Outcome {
-    Done,
+    // the message pipe ended; the caller reconnects
+    Reconnect,
     Relink,
 }
 
-pub async fn run_loop<S: Store + Clone>(
+pub async fn run_loop<S: Store + Clone + 'static>(
     mut manager: Manager<S, Registered>,
-    cfg: &Config,
+    cfg: Arc<Config>,
 ) -> anyhow::Result<Outcome> {
-    let names = Names::resolve(&mut manager).await;
+    let names = Arc::new(Names::resolve(&mut manager).await);
 
     let messages = match manager.receive_messages().await {
         Ok(m) => m,
@@ -596,7 +605,8 @@ pub async fn run_loop<S: Store + Clone>(
     let mut live = false;
     // finished conversations kept warm so a reply to one continues its exact
     // messages array instead of rebuilding from the store
-    let mut cache = ConvoCache::new(CONVO_CACHE_CAP);
+    let cache = Arc::new(Mutex::new(ConvoCache::new(CONVO_CACHE_CAP)));
+    let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_PROMPTS));
 
     info!("running. send `{}  <prompt>` in any chat", cfg.trigger);
 
@@ -613,7 +623,16 @@ pub async fn run_loop<S: Store + Clone>(
                         if !live {
                             continue;
                         }
-                        process_content(&mut manager, cfg, &names, &mut cache, &content).await;
+                        let mut manager = manager.clone();
+                        let cfg = cfg.clone();
+                        let names = names.clone();
+                        let cache = cache.clone();
+                        let slots = slots.clone();
+                        // presage spawns onto the ambient LocalSet, so stay on it
+                        tokio::task::spawn_local(async move {
+                            let _slot = slots.acquire().await;
+                            process_content(&mut manager, &cfg, &names, &cache, &content).await;
+                        });
                     }
                     Received::DecryptionError(sender) => {
                         info!("dropping undecryptable message from {sender:?}");
@@ -628,5 +647,6 @@ pub async fn run_loop<S: Store + Clone>(
             }
         }
     }
-    Ok(Outcome::Done)
+    warn!("signal message stream ended");
+    Ok(Outcome::Reconnect)
 }

@@ -13,6 +13,9 @@ mod recipient;
 mod tools;
 mod transcript;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Context as _;
 use futures::{channel::oneshot, future};
 use tracing::{error, info, warn};
@@ -94,7 +97,11 @@ async fn link(
     Ok(manager)
 }
 
+// how long to wait before rebuilding a dropped connection
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
 async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Result<()> {
+    let cfg = Arc::new(cfg);
     loop {
         let store = open_store(&db_path).await?;
         let manager = if store.is_registered().await {
@@ -103,8 +110,11 @@ async fn run(db_path: String, cfg: Config, device_name: String) -> anyhow::Resul
             link(store, device_name.clone()).await?
         };
 
-        match run_loop(manager, &cfg).await? {
-            Outcome::Done => return Ok(()),
+        match run_loop(manager, cfg.clone()).await? {
+            Outcome::Reconnect => {
+                warn!("reconnecting in {}s", RECONNECT_DELAY.as_secs());
+                tokio::time::sleep(RECONNECT_DELAY).await;
+            }
             Outcome::Relink => {
                 warn!("device was unlinked; clearing registration to re-link");
                 let mut store = open_store(&db_path).await?;
@@ -140,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "signal-ai-bot".to_string());
 
-    // presage's Manager is !Send, so it has to run on a LocalSet
+    // presage spawns its own !Send tasks, so everything runs on a LocalSet
     let local = tokio::task::LocalSet::new();
     local.run_until(run(db_path, cfg, device_name)).await
 }
