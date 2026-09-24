@@ -2,7 +2,7 @@ use presage::libsignal_service::content::{Content, ContentBody, DataMessage};
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::proto::body_range::AssociatedValue;
 use presage::libsignal_service::proto::data_message::Quote;
-use presage::libsignal_service::proto::sync_message::Sent;
+use presage::libsignal_service::proto::sync_message::{Content as SyncContent, Sent};
 use presage::libsignal_service::proto::{AttachmentPointer, BodyRange};
 use presage::manager::Registered;
 use presage::proto::{EditMessage, SyncMessage};
@@ -155,9 +155,10 @@ fn original_dm(content: &Content) -> Option<&DataMessage> {
     match &content.body {
         ContentBody::DataMessage(dm) => Some(dm),
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent: Some(Sent {
-                message: Some(dm), ..
-            }),
+            content:
+                Some(SyncContent::Sent(Sent {
+                    message: Some(dm), ..
+                })),
             ..
         }) => Some(dm),
         _ => None,
@@ -241,21 +242,22 @@ pub(crate) fn data_message(content: &Content) -> Option<(Option<u64>, &DataMessa
             data_message,
         }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent: Some(Sent {
-                message: Some(dm), ..
-            }),
+            content:
+                Some(SyncContent::Sent(Sent {
+                    message: Some(dm), ..
+                })),
             ..
         }) => (None, dm),
         ContentBody::SynchronizeMessage(SyncMessage {
-            sent:
-                Some(Sent {
+            content:
+                Some(SyncContent::Sent(Sent {
                     edit_message:
                         Some(EditMessage {
                             target_sent_timestamp,
                             data_message,
                         }),
                     ..
-                }),
+                })),
             ..
         }) => (Some((*target_sent_timestamp)?), data_message.as_ref()?),
         _ => return None,
@@ -359,7 +361,7 @@ pub async fn message_version<S: Store>(
     // content.timestamp() returns the *target* for edits; we need this revision's
     // own id (its envelope ts) so edit chains link by target instead of orphaning
     let own_ts = if target.is_some() {
-        content.metadata.timestamp.timestamp_millis() as u64
+        content.metadata.client_timestamp.timestamp_millis() as u64
     } else {
         content.timestamp()
     };

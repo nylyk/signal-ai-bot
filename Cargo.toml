@@ -5,8 +5,8 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-presage = { git = "https://github.com/whisperfish/presage" }
-presage-store-sqlite = { git = "https://github.com/whisperfish/presage" }
+presage = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
+presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "33dd1491130793390e356e15a5711f1e6ca14fdb" }
 
 anyhow = "1"
 base64 = "0.22"
@@ -37,7 +37,3 @@ tokio = { version = "1", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# required by presage's dependency tree, see presage README
-[patch.crates-io]
-curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
