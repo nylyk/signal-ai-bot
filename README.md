@@ -29,6 +29,7 @@ set via env vars (see `docker-compose.yml`):
 | `AUDIO`                  | no       | off                          | send voice messages — only enable for audio models   |
 | `AUDIO_SPEED`            | no       | `1.0`                        | speed up voice messages before sending (`0.5`–`2.0`) |
 | `DOCUMENTS`              | no       | off                          | send pdfs — only enable for models that read them    |
+| `MEMORY`                 | no       | off                          | let the model save, read and delete memories         |
 | `EXTRA_TOOLS`            | no       | none                         | json array of tools the provider runs itself         |
 | `TRIGGER`                | no       | `@ai`                        | prefix that summons the bot                          |
 | `CONTEXT_MESSAGES`       | no       | `5`                          | recent messages fed as context (max; see `@ai2`)     |
@@ -74,6 +75,14 @@ a second tool, `load_avatar`, takes a display name and returns that person's
 profile picture, or the group's own picture when given the group title. it
 reaches the thread's participants only, never the rest of the contact store, and
 needs `VISION`.
+
+with `MEMORY` on, the model gets `list_memories`, `read_memory`, `save_memory`
+and `delete_memory`, and the system prompt lists the name of every saved memory
+as of the start of the conversation. each memory is one markdown file, named
+after the memory, and covers a single aspect — `alice-birthday`, not `alice`.
+names are lowercase letters, digits and dashes. memories belong to one chat:
+each chat has its own folder in `/data/memories`, named after the other
+person's uuid or the group's id.
 
 when a provider runs an image generation tool, the images it returns are posted
 into the chat as attachments. on openrouter that is one more `EXTRA_TOOLS` entry:

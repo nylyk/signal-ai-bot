@@ -10,6 +10,7 @@ use crate::ai::ToolCall;
 use crate::config::Config;
 use crate::images::encode_image;
 use crate::media::{fetch_media, fetch_raw, Media};
+use crate::memory;
 use crate::names::Names;
 
 const MAX_TEXT_BYTES: usize = 32 * 1024;
@@ -273,6 +274,9 @@ pub async fn dispatch<S: Store>(
     catalog: &Catalog,
     call: &ToolCall,
 ) -> ToolResult {
+    if cfg.memory && memory::handles(&call.name) {
+        return ToolResult::text(memory::dispatch(&memory::dir_of(thread), call).await);
+    }
     if call.name == LOAD_AVATAR {
         return load_avatar(manager, cfg, names, thread, call).await;
     }
@@ -377,6 +381,7 @@ mod tests {
             vision,
             audio,
             documents,
+            memory: false,
             audio_speed: 1.0,
             retention: None,
             ai: AiClient::new(

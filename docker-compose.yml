@@ -15,6 +15,7 @@ services:
       VISION: "false"
       AUDIO: "false"
       DOCUMENTS: "false"
+      MEMORY: "false"
       # EXTRA_TOOLS: '[{"type":"openrouter:web_search"}]'
       TRIGGER: "@ai"
       PROCESSING_MESSAGE: AI is processing...

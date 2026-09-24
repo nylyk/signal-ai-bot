@@ -162,6 +162,7 @@ mod tests {
             vision: true,
             audio: false,
             documents: false,
+            memory: false,
             audio_speed: 1.0,
             retention: None,
             ai: AiClient::new(

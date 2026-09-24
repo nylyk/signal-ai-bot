@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 
 use crate::ai::AiClient;
+use crate::memory;
 use crate::tools::{self, Kind};
 
 fn env_flag(name: &str) -> bool {
@@ -22,6 +23,7 @@ pub struct Config {
     pub vision: bool,
     pub audio: bool,
     pub documents: bool,
+    pub memory: bool,
     // playback rate applied to voice notes before chunking; above 1.0 fits more
     // of a long note into the model's 30s-per-clip limit
     pub audio_speed: f32,
@@ -66,6 +68,7 @@ impl Config {
         let vision = env_flag("VISION");
         let audio = env_flag("AUDIO");
         let documents = env_flag("DOCUMENTS");
+        let memory = env_flag("MEMORY");
         // tools the provider runs itself, passed through verbatim so any
         // provider's server-tool syntax works without a code change
         let extra_tools: Vec<serde_json::Value> = match std::env::var("EXTRA_TOOLS") {
@@ -75,6 +78,9 @@ impl Config {
             _ => Vec::new(),
         };
         let mut tool_defs = tools::definitions();
+        if memory {
+            tool_defs.extend(memory::definitions());
+        }
         tool_defs.extend(extra_tools);
         // clamped to atempo's per-instance range; 1.0 leaves the note untouched
         let audio_speed = std::env::var("AUDIO_SPEED")
@@ -93,6 +99,7 @@ impl Config {
             vision,
             audio,
             documents,
+            memory,
             audio_speed,
             retention,
             ai: AiClient::new(base, key, model, system, reasoning_budget, tool_defs),

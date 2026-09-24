@@ -20,6 +20,7 @@ use crate::convo_cache::{Cached, ConvoCache};
 use crate::history::{thread_history, HistMsg};
 use crate::images::fetch_images;
 use crate::media::{decode_data_uri, fetch_media, Media};
+use crate::memory;
 use crate::message::{
     ai_root_ts, content_attachments, extract, is_ai_message, requested_context, resolve_author,
     resolve_mentions, ReplyRef, Trigger,
@@ -522,7 +523,11 @@ async fn process_content<S: Store>(
                 &history,
             )
             .await;
-            let chat_context = names.chat_context(manager, &t.thread).await;
+            let mut chat_context = names.chat_context(manager, &t.thread).await;
+            if cfg.memory {
+                let memories = memory::prompt_section(&memory::dir_of(&t.thread)).await;
+                chat_context = format!("{chat_context}\n\n{memories}");
+            }
             (convo, media, chat_context, history.len())
         }
     };

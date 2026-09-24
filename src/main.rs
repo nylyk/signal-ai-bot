@@ -6,6 +6,7 @@ mod handler;
 mod history;
 mod images;
 mod media;
+mod memory;
 mod message;
 mod names;
 mod prune;
