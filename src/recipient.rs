@@ -8,7 +8,7 @@ use presage::manager::Registered;
 use presage::proto::EditMessage;
 use presage::store::{Store, Thread};
 
-use crate::message::BOT_FILE_NAME;
+use crate::message::bot_file_name;
 use presage::Manager;
 
 pub enum Recipient {
@@ -61,9 +61,9 @@ pub async fn upload<S: Store>(
     bytes: Vec<u8>,
 ) -> anyhow::Result<AttachmentPointer> {
     let spec = AttachmentSpec {
+        file_name: Some(bot_file_name(&mime)),
         content_type: mime,
         length: bytes.len(),
-        file_name: Some(BOT_FILE_NAME.to_string()),
         preview: None,
         voice_note: None,
         borderless: None,

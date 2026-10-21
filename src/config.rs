@@ -1,8 +1,14 @@
 use anyhow::Context as _;
+use presage::libsignal_service::proto::AttachmentPointer;
 
 use crate::ai::AiClient;
 use crate::memory;
 use crate::tools::{self, Kind};
+
+// the videos one request carries in full share this budget. google takes about
+// 20 MB per request, and a video travels inline as base64, a third larger than
+// the file: 10 MB becomes about 13.3 MB, leaving the rest for the prompt
+pub const MAX_VIDEO_BYTES: u32 = 10 * 1024 * 1024;
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|s| {
@@ -21,6 +27,7 @@ pub struct Config {
     pub tool_msg: String,
     pub context_messages: usize,
     pub vision: bool,
+    pub video: bool,
     pub audio: bool,
     pub documents: bool,
     pub memory: bool,
@@ -66,6 +73,7 @@ impl Config {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         let vision = env_flag("VISION");
+        let video = env_flag("VIDEO");
         let audio = env_flag("AUDIO");
         let documents = env_flag("DOCUMENTS");
         let memory = env_flag("MEMORY");
@@ -97,6 +105,7 @@ impl Config {
             tool_msg,
             context_messages,
             vision,
+            video,
             audio,
             documents,
             memory,
@@ -107,14 +116,15 @@ impl Config {
     }
 
     // is this kind attached to its turn directly, rather than only listed?
-    pub fn sent_inline(&self, mime: &str) -> bool {
-        self.can_load(mime) && tools::kind_of(mime) != Some(Kind::Text)
+    pub fn sent_inline(&self, att: &AttachmentPointer) -> bool {
+        self.can_load(att) && tools::kind_of(att.content_type()) != Some(Kind::Text)
     }
 
     // can the model be given this attachment, either inline or on request?
-    pub fn can_load(&self, mime: &str) -> bool {
-        match tools::kind_of(mime) {
+    pub fn can_load(&self, att: &AttachmentPointer) -> bool {
+        match tools::kind_of(att.content_type()) {
             Some(Kind::Image) => self.vision,
+            Some(Kind::Video) => self.video && att.size.is_some_and(|s| s <= MAX_VIDEO_BYTES),
             Some(Kind::Audio) => self.audio,
             Some(Kind::Text) => true,
             Some(Kind::Document) => self.documents,

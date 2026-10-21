@@ -30,10 +30,16 @@ fn quote_author_uuid(quote: &Quote) -> Option<Uuid> {
 // body_ranges says which aci each one refers to
 const MENTION: char = '\u{FFFC}';
 
-// file name the bot gives every attachment it sends, so a message outside the
-// placeholder-edit chain can still be told apart from the owner's own. signal
-// keeps it in the pointer and shows it nowhere in the conversation.
-pub const BOT_FILE_NAME: &str = "signal-ai-bot.png";
+// every attachment the bot sends has a file name with this stem, so a message
+// outside the placeholder-edit chain can still be told apart from the owner's
+// own. signal keeps the name in the pointer and shows it nowhere in the chat.
+const BOT_FILE_STEM: &str = "signal-ai-bot";
+
+// a video takes its extension from its mime type; anything else is named .png
+pub fn bot_file_name(mime: &str) -> String {
+    let ext = mime.strip_prefix("video/").unwrap_or("png");
+    format!("{BOT_FILE_STEM}.{ext}")
+}
 
 // the aci a mention range points at (uuid string or 16-byte binary form)
 fn mention_aci(range: &BodyRange) -> Option<Uuid> {
@@ -138,7 +144,12 @@ pub fn requested_context(body: &str, trigger: &str) -> Option<usize> {
 }
 
 fn sent_by_bot(atts: &[AttachmentPointer]) -> bool {
-    !atts.is_empty() && atts.iter().all(|a| a.file_name() == BOT_FILE_NAME)
+    !atts.is_empty()
+        && atts.iter().all(|a| {
+            a.file_name()
+                .strip_prefix(BOT_FILE_STEM)
+                .is_some_and(|ext| ext.starts_with('.'))
+        })
 }
 
 // a sticker's image is not in `attachments`, so fold it in
@@ -386,5 +397,22 @@ mod tests {
         assert_eq!(requested_context("hey @ai12", "@ai"), Some(12));
         assert_eq!(requested_context("@ai what's up", "@ai"), None);
         assert_eq!(requested_context("nothing here", "@ai"), None);
+    }
+
+    #[test]
+    fn recognises_the_bots_own_images_and_videos() {
+        let att = |mime: &str| AttachmentPointer {
+            file_name: Some(bot_file_name(mime)),
+            ..Default::default()
+        };
+        assert_eq!(bot_file_name("image/jpeg"), "signal-ai-bot.png");
+        assert_eq!(bot_file_name("video/mp4"), "signal-ai-bot.mp4");
+        assert_eq!(bot_file_name("video/webm"), "signal-ai-bot.webm");
+        assert!(sent_by_bot(&[att("image/png"), att("video/webm")]));
+        let theirs = AttachmentPointer {
+            file_name: Some("clip.mp4".to_string()),
+            ..Default::default()
+        };
+        assert!(!sent_by_bot(&[att("video/mp4"), theirs]));
     }
 }

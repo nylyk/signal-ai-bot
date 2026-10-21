@@ -2,8 +2,8 @@
 
 a signal client that runs an openai-compatible chatbot in your chats. start a
 message with `@ai` and the bot replies. works in 1:1 and group chats, with
-text, images (vision models) and voice messages (audio models), and uses recent
-messages as context. digits right after the trigger shorten that window for one
+text, images (vision models), videos (video models) and voice messages (audio
+models), and uses recent messages as context. digits right after the trigger shorten that window for one
 prompt — `@ai2` sees only the last two messages.
 
 ## run
@@ -26,6 +26,7 @@ set via env vars (see `docker-compose.yml`):
 | `SYSTEM_PROMPT`          | no       | none                         | system prompt                                        |
 | `REASONING_BUDGET`       | no       | `0`                          | `0` off, `N` token cap, `-1` unlimited (llama.cpp)   |
 | `VISION`                 | no       | off                          | send images — only enable for vision models          |
+| `VIDEO`                  | no       | off                          | send videos — only enable for models that watch them |
 | `AUDIO`                  | no       | off                          | send voice messages — only enable for audio models   |
 | `AUDIO_SPEED`            | no       | `1.0`                        | speed up voice messages before sending (`0.5`–`2.0`) |
 | `DOCUMENTS`              | no       | off                          | send pdfs — only enable for models that read them    |
@@ -62,9 +63,15 @@ needs no round-trip; those are marked `(shown above)`.
 text is always readable — anything `text/*` plus json, xml, yaml, toml and the
 like, including the `text/x-signal-plain` attachment signal uses for an
 oversized message body. images, voice messages and pdfs each need their flag
-(`VISION`, `AUDIO`, `DOCUMENTS`); pdfs travel as a `file` content part, which
-hosted providers parse (openrouter bills per page on models without native
-document input) and llama.cpp does not accept at all.
+(`VISION`, `AUDIO`, `DOCUMENTS`), and so do videos (`VIDEO`): mp4 or webm up to
+10 MB, sent as a `video_url` part holding a data uri. the videos one request
+carries share those 10 MB; one that does not fit is listed as
+`(not shown; load_attachment fetches it)`. a video goes upstream only in the
+turn that first sends it; a continued conversation keeps a note naming its id
+instead, and the model reloads it with `load_attachment` if it needs it again.
+pdfs travel as a `file` content part, which hosted providers parse (openrouter
+bills per page on models without native document input) and llama.cpp does not
+accept at all.
 
 anything a flag rejects is still listed, marked `(unreadable)`, so the model
 knows the attachment is there instead of inventing an id for it. ids only ever
@@ -84,12 +91,28 @@ names are lowercase letters, digits and dashes. memories belong to one chat:
 each chat has its own folder in `/data/memories`, named after the other
 person's uuid or the group's id.
 
-when a provider runs an image generation tool, the images it returns are posted
-into the chat as attachments. on openrouter that is one more `EXTRA_TOOLS` entry:
+when a provider runs an image or video generation tool, the images and videos
+it returns are posted into the chat as attachments. on openrouter that is one
+more `EXTRA_TOOLS` entry:
 
 ```yaml
 EXTRA_TOOLS: '[{"type":"openrouter:image_generation"}]'
 ```
+
+for video, on a provider with google's video tool:
+
+```yaml
+EXTRA_TOOLS: '[{"type":"googleai:video_generation","parameters":{"aspect_ratio":"16:9","resolution":"720p"}}]'
+```
+
+the answer keeps what it made, unchanged, so a reply such as "make it red"
+hands the model its own image or video to edit. that holds while the
+conversation is cached (the last 20 answers, for 12 hours). after a restart,
+a reply to the generated media itself sends it as user input instead, when
+`VISION` or `VIDEO` is on. a video sent that way costs video input tokens on
+every turn, and google only edits uploaded videos up to 10 seconds long, and
+not in the eea, switzerland or the uk. a request body that would pass 48 MB
+drops media from the oldest messages first, generated videos included.
 
 `EXTRA_TOOLS` passes tools straight through to the provider, for the ones it runs
 itself. on openrouter:

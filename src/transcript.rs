@@ -51,6 +51,32 @@ impl Transcript {
         self.inlined.insert(ts);
     }
 
+    pub fn show_videos(&mut self, media: &Media) {
+        self.catalog.show_videos(media);
+    }
+
+    pub fn video_room(&self) -> u32 {
+        self.catalog.video_room()
+    }
+
+    // replaces every video_url part in `convo` with a note naming the video's
+    // attachment id, so a continuation does not send the video upstream again
+    pub fn drop_video_bytes(&mut self, convo: &mut [serde_json::Value]) {
+        let ids = self.catalog.take_shown_video_ids();
+        let parts = convo
+            .iter_mut()
+            .filter_map(|turn| turn.get_mut("content").and_then(|c| c.as_array_mut()))
+            .flatten()
+            .filter(|p| p["type"] == "video_url");
+        for (part, id) in parts.zip(ids) {
+            let note = match id {
+                Some(id) => format!("[video #{id} was shown here; load_attachment brings it back]"),
+                None => "[a video was shown here]".to_string(),
+            };
+            *part = serde_json::json!({ "type": "text", "text": note });
+        }
+    }
+
     pub fn user_text(
         &mut self,
         ts: u64,
@@ -116,10 +142,10 @@ impl Transcript {
 }
 
 // a `user` turn: plain string content when there's no media, else a multimodal
-// parts array with the text, then each image as an image_url, then each audio
-// clip. audio goes last because gemma 4 asks for it after the text, and it
-// carries raw base64 rather than a data uri — llama.cpp only unwraps `data:`
-// uris for images.
+// parts array with the text, then each image as an image_url, each video as a
+// video_url, then each audio clip. audio goes last because gemma 4 asks for it
+// after the text, and it carries raw base64 rather than a data uri — llama.cpp
+// only unwraps `data:` uris for images.
 pub fn user_turn_value(text: String, media: &Media) -> serde_json::Value {
     if media.is_empty() {
         return serde_json::json!({ "role": "user", "content": text });
@@ -129,6 +155,12 @@ pub fn user_turn_value(text: String, media: &Media) -> serde_json::Value {
         parts.push(serde_json::json!({
             "type": "image_url",
             "image_url": { "url": format!("data:{mime};base64,{data}") }
+        }));
+    }
+    for (_, uri) in &media.videos {
+        parts.push(serde_json::json!({
+            "type": "video_url",
+            "video_url": { "url": uri }
         }));
     }
     for data in &media.audio {
@@ -160,6 +192,7 @@ mod tests {
             tool_msg: String::new(),
             context_messages: 5,
             vision: true,
+            video: false,
             audio: false,
             documents: false,
             memory: false,
@@ -307,6 +340,72 @@ mod tests {
             contents(&turns),
             vec!["it's a cat", "[msg 1] [in reply to you] bob: are you sure?"]
         );
+    }
+
+    #[test]
+    fn sends_a_video_as_a_video_url_part() {
+        let media = Media {
+            videos: vec![(
+                AttachmentPointer::default(),
+                "data:video/mp4;base64,AAAA".to_string(),
+            )],
+            ..Media::default()
+        };
+        let turn = user_turn_value("look".to_string(), &media);
+        assert_eq!(
+            turn["content"][1],
+            serde_json::json!({ "type": "video_url", "video_url": { "url": "data:video/mp4;base64,AAAA" } })
+        );
+    }
+
+    #[test]
+    fn keeps_a_note_naming_the_attachment_in_place_of_a_sent_video() {
+        let mut cfg = config();
+        cfg.video = true;
+        let clip = AttachmentPointer {
+            content_type: Some("video/mp4".to_string()),
+            size: Some(1),
+            digest: Some(vec![7]),
+            ..Default::default()
+        };
+        let other = AttachmentPointer {
+            content_type: Some("video/mp4".to_string()),
+            size: Some(1),
+            digest: Some(vec![8]),
+            ..Default::default()
+        };
+        let media = Media {
+            videos: vec![
+                (clip.clone(), "data:video/mp4;base64,AAAA".to_string()),
+                (other.clone(), "data:video/mp4;base64,BBBB".to_string()),
+            ],
+            ..Media::default()
+        };
+        let mut t = Transcript::default();
+        t.show_videos(&media);
+        let note = t.announce(
+            &cfg,
+            &[AttachmentPointer::default(), clip, other],
+            Inline::Shown,
+        );
+        assert!(note.contains("#2 video/mp4 1B (shown above)"));
+        let mut convo = vec![
+            serde_json::json!({ "role": "assistant", "content": "earlier" }),
+            user_turn_value("look".to_string(), &media),
+        ];
+        t.drop_video_bytes(&mut convo);
+        let turn = &convo[1];
+        assert_eq!(turn["content"][0]["text"], "look");
+        assert_eq!(
+            turn["content"][1],
+            serde_json::json!({ "type": "text", "text": "[video #2 was shown here; load_attachment brings it back]" })
+        );
+        assert_eq!(
+            turn["content"][2]["text"],
+            "[video #3 was shown here; load_attachment brings it back]"
+        );
+        assert_eq!(t.video_room(), crate::config::MAX_VIDEO_BYTES);
+        assert!(!turn.to_string().contains("AAAA"));
     }
 
     #[test]

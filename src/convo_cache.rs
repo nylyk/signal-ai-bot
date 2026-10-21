@@ -8,12 +8,13 @@ use crate::transcript::Transcript;
 // conversation keeps resetting its age — in effect, 12h since its last answer.
 const TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
-// a finished conversation, ready to be continued. `convo` holds the exact turns
-// that were sent (through and including the bot's answer), so a reply just
-// appends to it and llama-server keeps its prompt-cache prefix. `chat_context`
-// is captured so the reused `system` message stays byte-identical, and `tip_ts`
-// is the answer's final-edit timestamp: the lower bound for gathering messages
-// that arrived after this answer.
+// a finished conversation, ready to be continued. `convo` holds the turns that
+// were sent (through and including the bot's answer), each user video swapped
+// for a note naming its attachment id, so a reply just appends to it and
+// llama-server keeps its prompt-cache prefix. `chat_context` is captured so the
+// reused `system` message stays byte-identical, and `tip_ts` is the answer's
+// final-edit timestamp: the lower bound for gathering messages that arrived
+// after this answer.
 pub struct Cached {
     pub convo: Vec<serde_json::Value>,
     pub chat_context: String,
@@ -32,7 +33,7 @@ struct Entry {
 // process-lifetime cache of conversations keyed by the bot answer's root
 // (placeholder) timestamp — the same value a later reply resolves to via
 // `ai_root_ts`. messages of the same answer that sit outside its edit chain
-// (generated images travel as their own message) reach the entry through
+// (generated media travels as its own message) reach the entry through
 // `aliases`. bounded by `cap` (oldest-inserted evicted first) and by `TTL`.
 pub struct ConvoCache {
     cap: usize,

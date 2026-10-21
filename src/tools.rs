@@ -7,13 +7,14 @@ use presage::Manager;
 use tracing::info;
 
 use crate::ai::ToolCall;
-use crate::config::Config;
+use crate::config::{Config, MAX_VIDEO_BYTES};
 use crate::images::encode_image;
 use crate::media::{fetch_media, fetch_raw, Media};
 use crate::memory;
 use crate::names::Names;
 
 const MAX_TEXT_BYTES: usize = 32 * 1024;
+const NOT_SHOWN: &str = " (not shown; load_attachment fetches it)";
 
 const LOAD_ATTACHMENT: &str = "load_attachment";
 const LOAD_AVATAR: &str = "load_avatar";
@@ -21,6 +22,7 @@ const LOAD_AVATAR: &str = "load_avatar";
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Image,
+    Video,
     Audio,
     Text,
     Document,
@@ -31,6 +33,7 @@ pub fn kind_of(mime: &str) -> Option<Kind> {
     let mime = mime.split(';').next().unwrap_or_default().trim();
     match mime {
         m if m.starts_with("image/") => Some(Kind::Image),
+        "video/mp4" | "video/webm" => Some(Kind::Video),
         m if m.starts_with("audio/") => Some(Kind::Audio),
         m if m.starts_with("text/") => Some(Kind::Text),
         "application/json"
@@ -75,6 +78,9 @@ struct Entry {
 #[derive(Default, Clone)]
 pub struct Catalog {
     entries: Vec<Entry>,
+    // `shown_videos` holds the videos whose bytes the conversation carries, in
+    // the order its video_url parts appear
+    shown_videos: Vec<AttachmentPointer>,
 }
 
 impl Catalog {
@@ -103,10 +109,13 @@ impl Catalog {
             if let Some(size) = ptr.size {
                 s.push_str(&format!(" {}", human_size(size)));
             }
-            if !cfg.can_load(&mime) {
+            if !cfg.can_load(ptr) {
                 s.push_str(" (unreadable)");
-            } else if inline == Inline::Shown && cfg.sent_inline(&mime) {
-                s.push_str(" (shown above)");
+            } else if inline == Inline::Shown && cfg.sent_inline(ptr) {
+                match kind_of(&mime) == Some(Kind::Video) && !self.shows(ptr) {
+                    true => s.push_str(NOT_SHOWN),
+                    false => s.push_str(" (shown above)"),
+                }
             }
             listed.push(s);
         }
@@ -114,6 +123,38 @@ impl Catalog {
             return String::new();
         }
         format!("[attachments: {}]", listed.join(", "))
+    }
+
+    pub fn show_videos(&mut self, media: &Media) {
+        self.shown_videos
+            .extend(media.videos.iter().map(|(ptr, _)| ptr.clone()));
+    }
+
+    // the bytes of video a request can still carry in full
+    pub fn video_room(&self) -> u32 {
+        let used: u32 = self.shown_videos.iter().map(|v| v.size()).sum();
+        MAX_VIDEO_BYTES.saturating_sub(used)
+    }
+
+    // the ids of the shown videos, in order, which then count as no longer shown
+    pub fn take_shown_video_ids(&mut self) -> Vec<Option<usize>> {
+        std::mem::take(&mut self.shown_videos)
+            .iter()
+            .map(|v| self.id_of(v))
+            .collect()
+    }
+
+    fn shows(&self, ptr: &AttachmentPointer) -> bool {
+        self.shown_videos
+            .iter()
+            .any(|v| v == ptr || same_file(v, ptr))
+    }
+
+    pub fn id_of(&self, ptr: &AttachmentPointer) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|e| e.ptr == *ptr || same_file(&e.ptr, ptr))
+            .map(|i| i + 1)
     }
 
     fn get(&self, id: usize) -> Option<&Entry> {
@@ -295,7 +336,7 @@ pub async fn dispatch<S: Store>(
     };
     info!(id, mime = %entry.mime, "loading attachment");
 
-    if !cfg.can_load(&entry.mime) {
+    if !cfg.can_load(&entry.ptr) {
         return ToolResult::text(format!(
             "error: attachment #{id} is {} and cannot be read",
             entry.mime
@@ -309,7 +350,13 @@ pub async fn dispatch<S: Store>(
             None => ToolResult::text(format!("error: attachment #{id} could not be loaded")),
         };
     }
-    let media = fetch_media(manager, cfg, ptrs).await;
+    if kind_of(&entry.mime) == Some(Kind::Video) && entry.ptr.size() > catalog.video_room() {
+        return ToolResult::text(format!(
+            "error: attachment #{id} does not fit beside the video already shown in this \
+             request. It can be loaded in reply to a later message."
+        ));
+    }
+    let media = fetch_media(manager, cfg, ptrs, catalog.video_room()).await;
     if media.is_empty() {
         return ToolResult::text(format!("error: attachment #{id} could not be loaded"));
     }
@@ -379,6 +426,7 @@ mod tests {
             tool_msg: String::new(),
             context_messages: 5,
             vision,
+            video: false,
             audio,
             documents,
             memory: false,
@@ -450,6 +498,79 @@ mod tests {
         assert!(note.ends_with("(unreadable)]"));
         let note = Catalog::default().announce(&config(true, false, true), &pdf, Inline::Listed);
         assert!(!note.contains("unreadable"));
+    }
+
+    #[test]
+    fn videos_are_readable_only_behind_the_flag() {
+        let clip = [pointer("video/mp4", "clip.mp4", 1)];
+        let note = Catalog::default().announce(&config(true, false, false), &clip, Inline::Listed);
+        assert!(note.ends_with("(unreadable)]"));
+        let mut cfg = config(true, false, false);
+        cfg.video = true;
+        let note = Catalog::default().announce(&cfg, &clip, Inline::Listed);
+        assert!(!note.contains('('));
+        let mov = [pointer("video/quicktime", "clip.mov", 1)];
+        let note = Catalog::default().announce(&cfg, &mov, Inline::Listed);
+        assert!(note.ends_with("(unreadable)]"));
+    }
+
+    #[test]
+    fn videos_too_large_or_of_unknown_size_are_unreadable() {
+        let mut cfg = config(true, false, false);
+        cfg.video = true;
+        let fits = [pointer("video/mp4", "fits.mp4", 10 * 1024 * 1024)];
+        let note = Catalog::default().announce(&cfg, &fits, Inline::Listed);
+        assert!(!note.contains('('));
+        let big = [pointer("video/mp4", "big.mp4", 10 * 1024 * 1024 + 1)];
+        let note = Catalog::default().announce(&cfg, &big, Inline::Shown);
+        assert!(note.ends_with("(unreadable)]"));
+        let mut unsized_clip = pointer("video/mp4", "clip.mp4", 1);
+        unsized_clip.size = None;
+        let note = Catalog::default().announce(&cfg, &[unsized_clip], Inline::Shown);
+        assert!(note.ends_with("(unreadable)]"));
+    }
+
+    fn shown(ptrs: &[AttachmentPointer]) -> Media {
+        Media {
+            videos: ptrs.iter().map(|p| (p.clone(), String::new())).collect(),
+            ..Media::default()
+        }
+    }
+
+    #[test]
+    fn marks_a_video_shown_only_while_its_bytes_are_in_the_conversation() {
+        let mut cfg = config(true, false, false);
+        cfg.video = true;
+        let clip = pointer("video/mp4", "clip.mp4", 1);
+        let mut catalog = Catalog::default();
+        catalog.show_videos(&shown(std::slice::from_ref(&clip)));
+        let note = catalog.announce(&cfg, std::slice::from_ref(&clip), Inline::Shown);
+        assert!(note.ends_with("(shown above)]"));
+
+        assert_eq!(catalog.take_shown_video_ids(), vec![Some(1)]);
+        let note = catalog.announce(&cfg, &[clip], Inline::Shown);
+        assert!(note.ends_with(&format!("{NOT_SHOWN}]")));
+    }
+
+    #[test]
+    fn shares_one_video_budget_across_a_request() {
+        let mut cfg = config(true, false, false);
+        cfg.video = true;
+        let first = pointer("video/mp4", "first.mp4", 8 * 1024 * 1024);
+        let second = pointer("video/mp4", "second.mp4", 8 * 1024 * 1024);
+        let mut catalog = Catalog::default();
+        catalog.show_videos(&shown(std::slice::from_ref(&first)));
+        assert_eq!(catalog.video_room(), 2 * 1024 * 1024);
+        let note = catalog.announce(&cfg, &[first, second], Inline::Shown);
+        assert_eq!(
+            note,
+            format!(
+                "[attachments: #1 video/mp4 first.mp4 8.0MB (shown above), \
+                 #2 video/mp4 second.mp4 8.0MB{NOT_SHOWN}]"
+            )
+        );
+        catalog.take_shown_video_ids();
+        assert_eq!(catalog.video_room(), MAX_VIDEO_BYTES);
     }
 
     #[test]

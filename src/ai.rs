@@ -22,13 +22,54 @@ impl ToolCall {
 }
 
 // what one streamed turn produced. `assistant` is the turn to append before
-// asking again; `images` holds data uris a provider-run image tool produced.
+// asking again.
 pub struct Completion {
     pub assistant: serde_json::Value,
     pub text: String,
-    pub images: Vec<String>,
+    pub generated: Generated,
     pub calls: Vec<ToolCall>,
 }
+
+// `Generated` holds the data uris a provider-run image or video tool returned
+// beside the answer
+#[derive(Default, Clone)]
+pub struct Generated {
+    pub images: Vec<String>,
+    pub videos: Vec<String>,
+}
+
+impl Generated {
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.videos.is_empty()
+    }
+
+    pub fn extend(&mut self, other: Generated) {
+        self.images.extend(other.images);
+        self.videos.extend(other.videos);
+    }
+
+    pub fn uris(&self) -> impl Iterator<Item = &String> {
+        self.images.iter().chain(&self.videos)
+    }
+
+    // echoed back in the shape they arrived in, which is the only one the api
+    // accepts on an assistant turn. an edit relies on the data being unchanged.
+    pub fn echo_onto(&self, assistant: &mut serde_json::Value) {
+        if !self.images.is_empty() {
+            assistant["images"] = media_parts(&self.images, "image_url");
+        }
+        if !self.videos.is_empty() {
+            assistant["videos"] = media_parts(&self.videos, "video_url");
+        }
+    }
+}
+
+// the api rejects a body over 64 MB; this leaves headroom below that
+const MAX_BODY_BYTES: usize = 48 * 1024 * 1024;
+const MEDIA_KEYS: [&str; 2] = ["images", "videos"];
+const MEDIA_PARTS: [&str; 4] = ["image_url", "video_url", "input_audio", "file"];
+const SHED_NOTE: &str =
+    "[the attachment shown here was dropped to keep the request small; load_attachment brings it back]";
 
 pub struct AiClient {
     http: reqwest::Client,
@@ -91,24 +132,21 @@ impl AiClient {
         self.stream_turn(messages, &self.tools, on_phase).await
     }
 
-    // one line to send with images the model made but said nothing about
+    // one line to send with media the model made but said nothing about
     pub async fn caption(
         &self,
         convo: &[serde_json::Value],
         chat_context: &str,
-        images: &[String],
+        generated: &Generated,
     ) -> anyhow::Result<String> {
-        let made = serde_json::json!({
-            "role": "assistant",
-            "content": "",
-            "images": images.iter().map(image_part).collect::<Vec<_>>(),
-        });
+        let mut made = serde_json::json!({ "role": "assistant", "content": "" });
+        generated.echo_onto(&mut made);
         self.ask_without_tools(
             convo,
             chat_context,
             vec![made],
-            "Write one short line to send along with the image you just made. \
-             Text only — do not make another image.",
+            "Write one short line to send along with the image or video you just made. \
+             Text only — do not make another.",
         )
         .await
     }
@@ -169,6 +207,18 @@ impl AiClient {
             body["tools"] = serde_json::json!(tools);
         }
 
+        let mut payload = serde_json::to_vec(&body)?;
+        if payload.len() > MAX_BODY_BYTES {
+            warn!(
+                bytes = payload.len(),
+                "request too large, dropping the oldest media"
+            );
+            if let Some(messages) = body["messages"].as_array_mut() {
+                shed_oldest_media(messages, payload.len(), MAX_BODY_BYTES);
+            }
+            payload = serde_json::to_vec(&body)?;
+        }
+
         debug!(messages = %redact_media(&messages), "sending request to ai");
 
         // reqwest prints the endpoint in its errors, which end up in the chat
@@ -176,7 +226,8 @@ impl AiClient {
             .http
             .post(&url)
             .bearer_auth(&self.key)
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
@@ -192,7 +243,7 @@ impl AiClient {
         let mut saw_reasoning = false;
         let mut phase: Option<Phase> = None;
         let mut calls: Vec<PartialCall> = Vec::new();
-        let mut images: Vec<String> = Vec::new();
+        let mut generated = Generated::default();
 
         'outer: while let Some(chunk) = stream.next().await {
             buf.extend_from_slice(&chunk.map_err(reqwest::Error::without_url)?);
@@ -216,14 +267,12 @@ impl AiClient {
                     warn!(message, "provider reported an error mid-stream");
                 }
                 let delta = &v["choices"][0]["delta"];
-                if let Some(generated) = delta["images"].as_array() {
-                    images.extend(
-                        generated
-                            .iter()
-                            .filter_map(|i| i["image_url"]["url"].as_str())
-                            .map(str::to_string),
-                    );
-                }
+                generated
+                    .images
+                    .extend(media_urls(&delta["images"], "image_url"));
+                generated
+                    .videos
+                    .extend(media_urls(&delta["videos"], "video_url"));
                 if let Some(fragments) = delta["tool_calls"].as_array() {
                     for f in fragments {
                         accumulate_call(&mut calls, f);
@@ -258,23 +307,32 @@ impl AiClient {
             assistant["tool_calls"] =
                 serde_json::json!(calls.iter().map(PartialCall::to_value).collect::<Vec<_>>());
         }
-        // echoed back in the shape they arrived in, which is the only one the
-        // api accepts on an assistant turn
-        if !images.is_empty() {
-            assistant["images"] =
-                serde_json::json!(images.iter().map(image_part).collect::<Vec<_>>());
-        }
+        generated.echo_onto(&mut assistant);
         Ok(Completion {
             assistant,
             text,
-            images,
+            generated,
             calls: calls.into_iter().map(PartialCall::into_call).collect(),
         })
     }
 }
 
-fn image_part(url: &String) -> serde_json::Value {
-    serde_json::json!({ "type": "image_url", "image_url": { "url": url } })
+fn media_urls<'a>(
+    parts: &'a serde_json::Value,
+    kind: &'a str,
+) -> impl Iterator<Item = String> + 'a {
+    parts
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(move |p| p[kind]["url"].as_str())
+        .map(str::to_string)
+}
+
+fn media_parts(urls: &[String], kind: &str) -> serde_json::Value {
+    urls.iter()
+        .map(|url| serde_json::json!({ "type": kind, kind: { "url": url } }))
+        .collect()
 }
 
 // a tool call being assembled: the arguments arrive as string fragments spread
@@ -336,22 +394,62 @@ fn now_line() -> String {
     )
 }
 
+fn is_media_part(part: &serde_json::Value) -> bool {
+    part["type"]
+        .as_str()
+        .is_some_and(|kind| MEDIA_PARTS.contains(&kind))
+}
+
+fn json_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+}
+
+// drops media from the oldest messages first until a body of `size` bytes fits
+// under `limit`, putting a note where a user turn's attachment was
+fn shed_oldest_media(messages: &mut [serde_json::Value], mut size: usize, limit: usize) {
+    for m in messages {
+        for key in MEDIA_KEYS {
+            if size <= limit {
+                return;
+            }
+            if let Some(media) = m.as_object_mut().and_then(|o| o.remove(key)) {
+                size = size.saturating_sub(json_len(&media));
+            }
+        }
+        let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        for part in parts.iter_mut().filter(|p| is_media_part(p)) {
+            if size <= limit {
+                return;
+            }
+            let dropped = std::mem::replace(
+                part,
+                serde_json::json!({ "type": "text", "text": SHED_NOTE }),
+            );
+            size = (size + json_len(part)).saturating_sub(json_len(&dropped));
+        }
+    }
+}
+
 // render the messages array as compact json for logging, replacing each media
 // part with a short placeholder so base64 payloads don't flood logs
 fn redact_media(messages: &[serde_json::Value]) -> String {
     let mut msgs = messages.to_vec();
     for m in &mut msgs {
-        if let Some(images) = m.get_mut("images") {
-            *images = serde_json::json!("<images omitted>");
+        for key in MEDIA_KEYS {
+            if let Some(media) = m.get_mut(key) {
+                *media = serde_json::json!(format!("<{key} omitted>"));
+            }
         }
         let Some(parts) = m.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
         for part in parts {
-            let Some(kind) = part.get("type").and_then(|t| t.as_str()) else {
+            let Some(kind) = part["type"].as_str() else {
                 continue;
             };
-            if matches!(kind, "image_url" | "input_audio" | "file") {
+            if MEDIA_PARTS.contains(&kind) {
                 *part = serde_json::json!({ "type": kind, kind: "<omitted>" });
             }
         }
@@ -448,5 +546,49 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "two");
         assert_eq!(calls[1].name, "one");
+    }
+
+    #[test]
+    fn echoes_generated_videos_in_the_shape_they_arrived_in() {
+        let delta = serde_json::json!({
+            "videos": [{ "type": "video_url", "index": 0, "video_url": { "url": "data:video/mp4;base64,AAAA" } }]
+        });
+        let generated = Generated {
+            images: Vec::new(),
+            videos: media_urls(&delta["videos"], "video_url").collect(),
+        };
+        let mut assistant = serde_json::json!({ "role": "assistant", "content": "" });
+        generated.echo_onto(&mut assistant);
+        assert_eq!(
+            assistant["videos"],
+            serde_json::json!([{ "type": "video_url", "video_url": { "url": "data:video/mp4;base64,AAAA" } }])
+        );
+        assert!(assistant.get("images").is_none());
+    }
+
+    #[test]
+    fn sheds_the_oldest_media_first_until_the_body_fits() {
+        let video = |url: &str| serde_json::json!({ "type": "video_url", "video_url": { "url": url.repeat(1000) } });
+        let mut messages = vec![
+            serde_json::json!({ "role": "user", "content": [{ "type": "text", "text": "a" }, video("1")] }),
+            serde_json::json!({ "role": "assistant", "content": "made", "videos": [video("2")] }),
+            serde_json::json!({ "role": "user", "content": [{ "type": "text", "text": "b" }, video("3")] }),
+        ];
+        let size = serde_json::to_vec(&messages).unwrap().len();
+        let limit = size - 1500;
+        shed_oldest_media(&mut messages, size, limit);
+        assert_eq!(messages[0]["content"][1]["text"], SHED_NOTE);
+        assert!(messages[1].get("videos").is_none());
+        assert_eq!(messages[2]["content"][1]["type"], "video_url");
+        assert!(serde_json::to_vec(&messages).unwrap().len() <= limit);
+    }
+
+    #[test]
+    fn redacts_videos_from_the_log() {
+        let logged = redact_media(&[
+            serde_json::json!({ "role": "assistant", "videos": [{ "video_url": { "url": "data:video/mp4;base64,AAAA" } }] }),
+            serde_json::json!({ "role": "user", "content": [{ "type": "video_url", "video_url": { "url": "data:video/mp4;base64,AAAA" } }] }),
+        ]);
+        assert!(!logged.contains("AAAA"));
     }
 }

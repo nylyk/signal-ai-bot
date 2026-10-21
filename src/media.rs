@@ -36,19 +36,37 @@ pub async fn fetch_raw<'a, S: Store>(
     out
 }
 
-// the encoded attachments of one turn: images as (mime, base64), audio as
-// base64 wav clips of at most 30s each, documents as (filename, data uri)
+// the encoded attachments of one turn: images as (mime, base64), videos as
+// (pointer, data uri), audio as base64 wav clips of at most 30s each, documents as
+// (filename, data uri)
 #[derive(Default)]
 pub struct Media {
     pub images: Vec<(String, String)>,
+    pub videos: Vec<(AttachmentPointer, String)>,
     pub audio: Vec<String>,
     pub files: Vec<(String, String)>,
 }
 
 impl Media {
     pub fn is_empty(&self) -> bool {
-        self.images.is_empty() && self.audio.is_empty() && self.files.is_empty()
+        self.images.is_empty()
+            && self.videos.is_empty()
+            && self.audio.is_empty()
+            && self.files.is_empty()
     }
+
+    pub fn extend(&mut self, other: Media) {
+        self.images.extend(other.images);
+        self.videos.extend(other.videos);
+        self.audio.extend(other.audio);
+        self.files.extend(other.files);
+    }
+}
+
+fn data_uri(mime: &str, bytes: &[u8]) -> String {
+    let mut uri = format!("data:{mime};base64,");
+    BASE64_STANDARD.encode_string(bytes, &mut uri);
+    uri
 }
 
 // split a "data:<mime>;base64,<data>" uri into its mime and decoded bytes
@@ -76,11 +94,34 @@ pub async fn fetch_documents<S: Store>(
             .clone()
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("document-{}.pdf", i + 1));
-        let mut uri = format!("data:{};base64,", p.content_type());
-        BASE64_STANDARD.encode_string(&bytes, &mut uri);
-        out.push((name, uri));
+        out.push((name, data_uri(p.content_type(), &bytes)));
     }
     out
+}
+
+pub async fn fetch_videos<S: Store>(
+    manager: &mut Manager<S, Registered>,
+    ptrs: &[AttachmentPointer],
+) -> Vec<(AttachmentPointer, String)> {
+    fetch_raw(manager, ptrs, "video")
+        .await
+        .into_iter()
+        .map(|(p, bytes)| (p.clone(), data_uri(p.content_type(), &bytes)))
+        .collect()
+}
+
+// the videos, in order, that fit into `room` bytes together
+fn within_room(videos: Vec<AttachmentPointer>, mut room: u32) -> Vec<AttachmentPointer> {
+    videos
+        .into_iter()
+        .filter(|v| {
+            let fits = v.size() <= room;
+            if fits {
+                room -= v.size();
+            }
+            fits
+        })
+        .collect()
 }
 
 // download whichever of a message's attachments the enabled modalities cover
@@ -88,15 +129,36 @@ pub async fn fetch_media<S: Store>(
     manager: &mut Manager<S, Registered>,
     cfg: &Config,
     atts: &[AttachmentPointer],
+    video_room: u32,
 ) -> Media {
-    let loadable: Vec<AttachmentPointer> = atts
-        .iter()
-        .filter(|a| cfg.can_load(a.content_type()))
-        .cloned()
-        .collect();
+    let loadable: Vec<AttachmentPointer> =
+        atts.iter().filter(|a| cfg.can_load(a)).cloned().collect();
+    let videos = within_room(of_kind(&loadable, Kind::Video), video_room);
     Media {
         images: fetch_images(manager, &of_kind(&loadable, Kind::Image)).await,
+        videos: fetch_videos(manager, &videos).await,
         audio: fetch_audio(manager, &of_kind(&loadable, Kind::Audio), cfg.audio_speed).await,
         files: fetch_documents(manager, &of_kind(&loadable, Kind::Document)).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn video(size: u32) -> AttachmentPointer {
+        AttachmentPointer {
+            size: Some(size),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn takes_only_the_videos_that_fit_together() {
+        let picked = within_room(vec![video(6), video(6), video(3)], 10);
+        assert_eq!(
+            picked.iter().map(|v| v.size()).collect::<Vec<_>>(),
+            vec![6, 3]
+        );
     }
 }

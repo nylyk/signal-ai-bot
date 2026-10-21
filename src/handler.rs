@@ -14,7 +14,7 @@ use presage::Manager;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::ai::{Phase, ToolCall};
+use crate::ai::{Generated, Phase, ToolCall};
 use crate::config::Config;
 use crate::convo_cache::{Cached, ConvoCache};
 use crate::history::{thread_history, HistMsg};
@@ -107,11 +107,11 @@ async fn trigger_turn<S: Store>(
     let mut q =
         ctx.transcript
             .user_text(trigger_ts, sender, reply_to.as_ref(), trigger.body.trim());
+    let mut media = fetch_media(manager, cfg, &trigger.own_atts, ctx.transcript.video_room()).await;
+    ctx.transcript.show_videos(&media);
     let mut notes = vec![ctx
         .transcript
         .announce(cfg, &trigger.own_atts, Inline::Shown)];
-
-    let mut media = fetch_media(manager, cfg, &trigger.own_atts).await;
     if !media.is_empty() {
         ctx.transcript.mark_inlined(trigger_ts);
     }
@@ -130,7 +130,6 @@ async fn trigger_turn<S: Store>(
         }
         Some(qts) => {
             let ptrs = stored_attachments(manager, &trigger.thread, qts).await;
-            notes.push(ctx.transcript.announce(cfg, &ptrs, Inline::Shown));
             // a file attached to both messages is already encoded in this turn
             let fresh: Vec<_> = ptrs
                 .iter()
@@ -138,8 +137,11 @@ async fn trigger_turn<S: Store>(
                 .cloned()
                 .collect();
             let overlaps = fresh.len() < ptrs.len();
-            let mut quoted = fetch_media(manager, cfg, &fresh).await;
-            let used_thumb = cfg.vision && quoted.images.is_empty() && !overlaps;
+            let mut quoted = fetch_media(manager, cfg, &fresh, ctx.transcript.video_room()).await;
+            ctx.transcript.show_videos(&quoted);
+            notes.push(ctx.transcript.announce(cfg, &ptrs, Inline::Shown));
+            let used_thumb =
+                cfg.vision && quoted.images.is_empty() && quoted.videos.is_empty() && !overlaps;
             if used_thumb {
                 quoted.images = fetch_images(manager, &trigger.quoted_thumbnails).await;
             }
@@ -148,6 +150,7 @@ async fn trigger_turn<S: Store>(
                 store_atts = ptrs.len(),
                 thumb_ptrs = trigger.quoted_thumbnails.len(),
                 images = quoted.images.len(),
+                videos = quoted.videos.len(),
                 audio = quoted.audio.len(),
                 files = quoted.files.len(),
                 used_thumb,
@@ -162,9 +165,7 @@ async fn trigger_turn<S: Store>(
             if !quoted.is_empty() {
                 ctx.transcript.mark_inlined(qts);
             }
-            media.images.extend(quoted.images);
-            media.audio.extend(quoted.audio);
-            media.files.extend(quoted.files);
+            media.extend(quoted);
         }
         None if cfg.vision && !trigger.quoted_thumbnails.is_empty() => {
             media
@@ -224,11 +225,12 @@ struct TriggerRef {
 
 // post the placeholder, edit it through each phase as the completion streams,
 // then edit it into the answer. returns (answer root ts, answer tip ts, the
-// generated-image message's ts if one was sent, answer text, the convo it was
-// given), so the caller can cache the finished conversation for continuation.
+// generated-media message's ts if one was sent, answer text, the convo through
+// the answer), so the caller can cache the finished conversation for
+// continuation.
 async fn handle_trigger<S: Store>(
     manager: &mut Manager<S, Registered>,
-    ctx: &Ctx<'_>,
+    ctx: &mut Ctx<'_>,
     recipient: Recipient,
     trigger: &TriggerRef,
     mut convo: Vec<serde_json::Value>,
@@ -259,7 +261,9 @@ async fn handle_trigger<S: Store>(
     let mut last_ts = placeholder_ts;
     let mut shown: Option<Phase> = None;
     let mut answer = String::new();
-    let mut generated: Vec<String> = Vec::new();
+    let mut generated = Generated::default();
+    // `unechoed` holds what the final turn made, which no turn in `convo` carries
+    let mut unechoed = Generated::default();
     // tool calls already made and answered; repeating one means the model is
     // going in circles rather than making progress
     let mut spent: HashSet<(String, String)> = HashSet::new();
@@ -313,10 +317,11 @@ async fn handle_trigger<S: Store>(
                 break;
             }
         };
-        generated.extend(turn.images);
+        generated.extend(turn.generated.clone());
 
         if turn.calls.is_empty() {
             answer = turn.text;
+            unechoed = turn.generated;
             break;
         }
         // every call is recorded before the verdict; a short-circuiting
@@ -327,6 +332,7 @@ async fn handle_trigger<S: Store>(
         }
         if repeating || round + 1 == MAX_AI_REQUESTS {
             needs_conclusion = true;
+            unechoed = turn.generated;
             break;
         }
         convo.push(turn.assistant);
@@ -349,6 +355,7 @@ async fn handle_trigger<S: Store>(
                 "content": result.content.clone(),
             }));
             if let Some(media) = result.media {
+                ctx.transcript.show_videos(&media);
                 follow_ups.push(user_turn_value(result.content, &media));
             }
         }
@@ -365,26 +372,30 @@ async fn handle_trigger<S: Store>(
         }
     }
 
-    // a provider-run image tool ends the turn with no words of its own
+    // a provider-run image or video tool ends the turn with no words of its own
     if !generated.is_empty() && answer.trim().is_empty() {
         match cfg.ai.caption(&convo, chat_context, &generated).await {
             Ok(line) if !line.trim().is_empty() => answer = line,
             Ok(_) => {}
-            Err(e) => error!(%e, "captioning generated images failed"),
+            Err(e) => error!(%e, "captioning generated media failed"),
         }
     }
     let mut attachments = Vec::new();
     if !generated.is_empty() {
-        info!(count = generated.len(), "posting generated images");
+        info!(
+            images = generated.images.len(),
+            videos = generated.videos.len(),
+            "posting generated media"
+        );
     }
-    for uri in &generated {
+    for uri in generated.uris() {
         let Some((mime, bytes)) = decode_data_uri(uri) else {
-            error!("generated image was not a readable data uri");
+            error!("generated media was not a readable data uri");
             continue;
         };
         match upload(manager, mime, bytes).await {
             Ok(pointer) => attachments.push(pointer),
-            Err(e) => error!(%e, "uploading generated image failed"),
+            Err(e) => error!(%e, "uploading generated media failed"),
         }
     }
 
@@ -408,17 +419,21 @@ async fn handle_trigger<S: Store>(
     }
 
     // an edit can't carry attachments — signal clients drop them — so generated
-    // images follow as their own message
-    let mut image_ts = None;
+    // media follows as its own message
+    let mut media_ts = None;
     if !attachments.is_empty() {
         let ts = now_ts().max(edit_ts + 1);
         match send_attachments(manager, &recipient, attachments, ts).await {
-            Ok(()) => image_ts = Some(ts),
-            Err(e) => error!(%e, "sending generated images failed"),
+            Ok(()) => media_ts = Some(ts),
+            Err(e) => error!(%e, "sending generated media failed"),
         }
     }
 
-    Ok((placeholder_ts, edit_ts, image_ts, answer, convo))
+    let mut closing = serde_json::json!({ "role": "assistant", "content": answer });
+    unechoed.echo_onto(&mut closing);
+    convo.push(closing);
+
+    Ok((placeholder_ts, edit_ts, media_ts, answer, convo))
 }
 
 async fn process_content<S: Store>(
@@ -543,7 +558,7 @@ async fn process_content<S: Store>(
     );
     match handle_trigger(
         manager,
-        &ctx,
+        &mut ctx,
         recipient,
         &TriggerRef {
             ts: trigger_ts,
@@ -555,11 +570,11 @@ async fn process_content<S: Store>(
     )
     .await
     {
-        Ok((root_ts, tip_ts, image_ts, answer, mut convo)) => {
+        Ok((root_ts, tip_ts, media_ts, answer, mut convo)) => {
             // don't cache error/empty sentinels, so a retry rebuilds cleanly
             let is_error = answer == EMPTY_ANSWER || answer.starts_with("ai error:");
             if !is_error {
-                convo.push(serde_json::json!({ "role": "assistant", "content": answer }));
+                transcript.drop_video_bytes(&mut convo);
                 let mut cache = cache.lock().await;
                 cache.insert(
                     root_ts,
@@ -570,9 +585,9 @@ async fn process_content<S: Store>(
                         tip_ts,
                     },
                 );
-                // a generated image is its own message, outside the edit chain
+                // generated media is its own message, outside the edit chain
                 // `ai_root_ts` walks, so point it at the answer explicitly
-                if let Some(ts) = image_ts {
+                if let Some(ts) = media_ts {
                     cache.alias(ts, root_ts);
                 }
                 // the answer we continued from is now superseded by this child
